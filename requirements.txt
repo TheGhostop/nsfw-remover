@@ -1,0 +1,6 @@
+aiogram
+nudenet
+pillow
+motor
+pymongo
+python-dotenv
