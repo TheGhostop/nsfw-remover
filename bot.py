@@ -13,7 +13,7 @@ from typing import Optional, Tuple, List, Dict, Any
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters.command import Command
-from aiogram.types import ChatPermissions
+from aiogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramAPIError
 from PIL import Image
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -27,19 +27,18 @@ MONGODB_URI = "mongodb+srv://deathhide08:UZYSj9T0VuAgIFAB@cluster0.elg19jx.mongo
 DATABASE_NAME = "nsfw_db"
 
 # Bot Settings
-WARN_LIMIT = 3
+WARN_LIMIT = 5  # CHANGED: 3 -> 5
 MAX_VIDEO_FRAMES = 6
 VIDEO_FPS = 1
 MUTE_DURATION = 1800
 
-# ===== IMPROVED THRESHOLDS =====
-# Log analysis: 95% skin, 76% flesh = Score 4.0 (not detected!)
-# ISSUE: Threshold too high, and skin-only not counted enough
-#
-# Fix: Lower threshold + Better skin-only scoring
-NSFW_MIN_SCORE = 4.0           # LOWERED from 5.0 (more aggressive)
+# Thresholds
+NSFW_MIN_SCORE = 4.0
 NSFW_SKIN_THRESHOLD = 0.35
 NSFW_FLESH_THRESHOLD = 0.35
+
+# Image URL for welcome message
+WELCOME_IMAGE_URL = "https://i.ibb.co/KzK6R4zW/IMG-20251117-212221-098.jpg"
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -67,16 +66,13 @@ chats_col = db.chats
 users_col = db.users
 
 def detect_nsfw_improved(image_path: str) -> Tuple[bool, Optional[dict]]:
-    """
-    Improved NSFW detection with better high-skin scoring
-    """
+    """Improved NSFW detection"""
     try:
         img = cv2.imread(image_path)
         if img is None:
             logger.warning(f"Could not read image: {image_path}")
             return False, None
         
-        # ====== METHOD 1: SKIN TONE DETECTION (HSV) ======
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_skin = np.array([0, 15, 60], dtype=np.uint8)
         upper_skin = np.array([25, 255, 255], dtype=np.uint8)
@@ -87,7 +83,6 @@ def detect_nsfw_improved(image_path: str) -> Tuple[bool, Optional[dict]]:
         
         logger.info(f"Skin pixels: {skin_percentage:.2%}")
         
-        # ====== METHOD 2: FLESH TONE (RGB) ======
         b, g, r = cv2.split(img)
         
         flesh_mask = cv2.inRange(r, 95, 220) & \
@@ -104,7 +99,6 @@ def detect_nsfw_improved(image_path: str) -> Tuple[bool, Optional[dict]]:
         
         logger.info(f"Flesh tone pixels: {flesh_percentage:.2%}")
         
-        # ====== METHOD 3: EDGE DETECTION ======
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 100, 200)
         edge_pixels = cv2.countNonZero(edges)
@@ -112,55 +106,45 @@ def detect_nsfw_improved(image_path: str) -> Tuple[bool, Optional[dict]]:
         
         logger.info(f"Edge density: {edge_density:.2%}")
         
-        # ====== METHOD 4: COLOR SATURATION ======
         saturation = hsv[:, :, 1]
         low_sat_pixels = np.sum(saturation < 100)
         low_sat_percentage = low_sat_pixels / saturation.size
         
         logger.info(f"Low saturation (skin-like): {low_sat_percentage:.2%}")
         
-        # ====== IMPROVED SCORING ======
         nsfw_score = 0
         reasons = []
         
-        # MAIN: Both skin AND flesh high
         if skin_percentage >= NSFW_SKIN_THRESHOLD and flesh_percentage >= NSFW_FLESH_THRESHOLD:
             nsfw_score += 3
             reasons.append(f"High skin ({skin_percentage:.1%}) AND flesh ({flesh_percentage:.1%})")
         
-        # VERY HIGH: Extreme skin percentage (like 95%+)
         if skin_percentage >= 0.85:
             nsfw_score += 2.5
             reasons.append(f"Extreme skin tone: {skin_percentage:.1%}")
         
-        # HIGH: Both above 50%
         elif skin_percentage >= 0.50 and flesh_percentage >= 0.50:
             nsfw_score += 2
             reasons.append(f"High skin ({skin_percentage:.1%}) + flesh ({flesh_percentage:.1%})")
         
-        # SKIN HEAVY: Very high skin alone
         if skin_percentage >= 0.70:
             nsfw_score += 1.5
             reasons.append(f"Very high skin coverage: {skin_percentage:.1%}")
         
-        # FLESH HEAVY: High flesh area
         if flesh_percentage > 0.50:
             nsfw_score += 1
             reasons.append(f"Flesh-heavy image: {flesh_percentage:.1%}")
         
-        # Skin + Edge (body curves)
         if skin_percentage > 0.30 and edge_density > 0.15:
             nsfw_score += 1.5
             reasons.append(f"Skin with defined edges (curves): {edge_density:.1%}")
         
-        # Skin + Natural look (low saturation)
         if skin_percentage > 0.40 and low_sat_percentage > 0.6:
             nsfw_score += 1.5
             reasons.append(f"Skin + low saturation (natural skin): {low_sat_percentage:.1%}")
         
         logger.info(f"NSFW Score: {nsfw_score:.1f}")
         logger.info(f"Reasons: {reasons}")
-        logger.info(f"Threshold: {NSFW_MIN_SCORE}")
         
         if nsfw_score >= NSFW_MIN_SCORE:
             return True, {
@@ -195,12 +179,11 @@ async def temporary_download(downloadable, file_extension: str = ""):
         if temp_file and os.path.exists(temp_file):
             try:
                 os.unlink(temp_file)
-                logger.info(f"Cleaned up temp file {temp_file}")
-            except Exception as e:
-                logger.error(f"Failed to delete temp file {temp_file}: {e}")
+            except:
+                pass
 
 def convert_webp_to_jpg_pil(webp_path: str) -> str:
-    """Convert WEBP to JPG using PIL"""
+    """Convert WEBP to JPG"""
     jpg_path = webp_path.replace('.webp', '.jpg')
     try:
         with Image.open(webp_path) as im:
@@ -210,28 +193,22 @@ def convert_webp_to_jpg_pil(webp_path: str) -> str:
                 background.save(jpg_path, "JPEG", quality=95)
             else:
                 im.convert("RGB").save(jpg_path, "JPEG", quality=95)
-        
-        logger.info(f"Successfully converted WEBP to JPG: {jpg_path}")
         return jpg_path
-    except Exception as e:
-        logger.error(f"PIL WEBP conversion failed: {e}")
+    except:
         return webp_path
 
 async def extract_frames(video_path: str, out_dir: str, fps: int = 1, max_frames: int = 6) -> List[str]:
-    """Extract frames from video/animation"""
+    """Extract frames from video"""
     os.makedirs(out_dir, exist_ok=True)
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-i", video_path,
-        "-vf", f"fps={fps}",
-        "-q:v", "3",
-        "-frames:v", str(max_frames),
+        "-i", video_path, "-vf", f"fps={fps}",
+        "-q:v", "3", "-frames:v", str(max_frames),
         os.path.join(out_dir, "frame_%03d.jpg")
     ]
     try:
         subprocess.run(cmd, check=True, timeout=60)
         frames = sorted([os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith('.jpg')])
-        logger.info(f"Extracted {len(frames)} frames from video")
         return frames[:max_frames]
     except:
         return []
@@ -242,10 +219,8 @@ async def analyze_image(image_path: str) -> Tuple[bool, Optional[dict]]:
         return False, None
     
     try:
-        is_nsfw, result = detect_nsfw_improved(image_path)
-        return is_nsfw, result
-    except Exception as e:
-        logger.error(f"Image analysis failed: {e}")
+        return detect_nsfw_improved(image_path)
+    except:
         return False, None
 
 async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
@@ -254,7 +229,7 @@ async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
         return False, None
     
     try:
-        logger.info(f"Analyzing {len(paths)} image(s) for NSFW content...")
+        logger.info(f"Analyzing {len(paths)} image(s)...")
         
         for idx, path in enumerate(paths, 1):
             is_nsfw, result = await analyze_image(path)
@@ -264,8 +239,7 @@ async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
         
         logger.info(f"All {len(paths)} frame(s) analyzed - SAFE")
         return False, None
-    except Exception as e:
-        logger.error(f"Batch analysis failed: {e}")
+    except:
         return False, None
 
 async def is_user_whitelisted(chat_id: int, user_id: int) -> bool:
@@ -376,7 +350,6 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
     
     logger.info(f"Starting analysis: msg_id={message.message_id}, user_id={user_id}")
     
-    # Check gbanned
     if user_id and await is_user_gbanned(user_id):
         try:
             await message.delete()
@@ -384,7 +357,6 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
             pass
         return
     
-    # Skip admins/whitelisted
     if user_id:
         if await is_user_admin(chat_id, user_id) or await is_user_whitelisted(chat_id, user_id):
             logger.info(f"Skipping admin/whitelisted: {user_id}")
@@ -443,10 +415,10 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
             is_nsfw, reason = await analyze_images([file_path])
 
         if is_nsfw:
-            logger.warning(f"NSFW DETECTED! msg_id={message.message_id}, user_id={user_id}, score={reason.get('score')}")
+            logger.warning(f"ðŸš¨ NSFW DETECTED! msg_id={message.message_id}, user_id={user_id}, score={reason.get('score')}")
             await take_moderation_action(message, reason, user_id, chat_id)
         else:
-            logger.info(f"Content is safe")
+            logger.info(f"âœ… Content is safe")
             
     except Exception as e:
         logger.error(f"Error in analysis: {e}")
@@ -463,7 +435,7 @@ async def take_moderation_action(message: types.Message, reason: dict, user_id: 
     
     # STEP 1: DELETE MESSAGE
     try:
-        logger.info(f"ATTEMPTING DELETE: msg_id={message.message_id}, chat_id={chat_id}")
+        logger.info(f"ðŸ—‘ï¸ ATTEMPTING DELETE: msg_id={message.message_id}")
         await message.delete()
         logger.info(f"âœ… SUCCESS: Deleted message {message.message_id}")
     except Exception as e:
@@ -518,10 +490,10 @@ async def take_moderation_action(message: types.Message, reason: dict, user_id: 
             await mute_user(chat_id, user_id, message.from_user.full_name if message.from_user else "User")
             
     except Exception as e:
-        logger.error(f"Warning failed: {e}")
+        logger.error(f"âš ï¸ Warning failed: {e}")
 
 async def mute_user(chat_id: int, user_id: int, user_name: str):
-    """Mute user for MUTE_DURATION"""
+    """Mute user with unmute button"""
     try:
         logger.info(f"ðŸ”‡ MUTING {user_id} in {chat_id}")
         
@@ -539,67 +511,163 @@ async def mute_user(chat_id: int, user_id: int, user_name: str):
             until_date=until_date
         )
         
+        # Create inline button for unmute
+        unmute_button = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="ðŸ”Š Unmute User", callback_data=f"unmute_{user_id}_{chat_id}")]
+        ])
+        
         mute_msg = await bot.send_message(
             chat_id, 
-            f"ðŸ”‡ {user_name} muted for {MUTE_DURATION // 60} min (NSFW violations)"
+            f"ðŸ”‡ {user_name} muted for {MUTE_DURATION // 60} min (NSFW violations)\n\nâ±ï¸ Will auto-unmute after timeout.",
+            reply_markup=unmute_button
         )
         
-        logger.info(f"âœ… User {user_id} muted")
-        
-        await asyncio.sleep(10)
-        try:
-            await mute_msg.delete()
-        except:
-            pass
+        logger.info(f"âœ… User {user_id} muted with unmute button")
         
     except Exception as e:
-        logger.error(f"Mute failed: {e}")
+        logger.error(f"ðŸ”‡ Mute failed: {e}")
+
+# ==================== CALLBACK HANDLERS ====================
+
+@dp.callback_query(lambda query: query.data.startswith("unmute_"))
+async def unmute_callback(query: types.CallbackQuery):
+    """Handle unmute button"""
+    try:
+        data_parts = query.data.split("_")
+        user_id = int(data_parts[1])
+        chat_id = int(data_parts[2])
+        
+        # Check if callback user is admin
+        if not await is_user_admin(chat_id, query.from_user.id):
+            await query.answer("âŒ Only admins can unmute!", show_alert=True)
+            return
+        
+        # Unmute user
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
+        )
+        
+        await query.answer("âœ… User unmuted!", show_alert=False)
+        
+        # Edit message
+        user = await bot.get_chat_member(chat_id, user_id)
+        await query.message.edit_text(
+            f"âœ… {user.user.full_name} unmuted by {query.from_user.full_name}"
+        )
+        
+        logger.info(f"ðŸ”Š User {user_id} unmuted by {query.from_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Unmute error: {e}")
+        await query.answer(f"âŒ Error: {str(e)}", show_alert=True)
 
 # ==================== COMMANDS ====================
 
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message):
-    await msg.answer(
-        "ðŸ›¡ï¸ NSFW Moderation Bot\n\n"
-        "âœ… Auto-detects & deletes NSFW\n"
-        "âœ… 3 warnings = mute\n"
-        "âœ… Global ban system\n\n"
-        "/warn_status /warn_reset /whitelist_add\n"
-        "/stats /gban /ungban /gbanlist"
-    )
-    logger.info(f"/start from {msg.from_user.id}")
+    """Start command with image and add button"""
+    
+    # Create add button
+    add_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="âž• Add to Group", url="https://t.me/NFSW_Protectionbot?startgroup=true")]
+    ])
+    
+    # Send with image
+    try:
+        await bot.send_photo(
+            msg.chat.id,
+            photo=WELCOME_IMAGE_URL,
+            caption="ðŸ›¡ï¸ **NSFW Content Moderation Bot**\n\n"
+                   "âœ… Auto-detects & deletes NSFW\n"
+                   "âœ… Smart warning system (5 = mute)\n"
+                   "âœ… Global ban system\n"
+                   "âœ… Admin controls\n\n"
+                   "ðŸš€ Click below to add me to your group!",
+            parse_mode="Markdown",
+            reply_markup=add_button
+        )
+    except Exception as e:
+        logger.error(f"Photo send failed: {e}")
+        # Fallback to text
+        await msg.answer(
+            "ðŸ›¡ï¸ **NSFW Content Moderation Bot**\n\n"
+            "âœ… Auto-detects & deletes NSFW\n"
+            "âœ… Smart warning system (5 = mute)\n"
+            "âœ… Global ban system\n"
+            "âœ… Admin controls\n\n"
+            "ðŸš€ Click below to add me to your group!",
+            parse_mode="Markdown",
+            reply_markup=add_button
+        )
+    
+    logger.info(f"ðŸš€ /start from {msg.from_user.id}")
 
 @dp.message(Command("help"))
 async def help_cmd(msg: types.Message):
-    await start_cmd(msg)
+    await msg.answer(
+        "ðŸ“‹ **Available Commands:**\n\n"
+        "/start - Show welcome message\n"
+        "/stats - Bot statistics (owner)\n"
+        "/warn_status - Check warnings\n"
+        "/warn_reset - Reset warnings (admin)\n"
+        "/whitelist_add - Whitelist user (admin)\n"
+        "/gban - Global ban (owner)\n"
+        "/ungban - Remove ban (owner)\n\n"
+        "ðŸ›¡ï¸ Protect your group now!",
+        parse_mode="Markdown"
+    )
 
 @dp.message(Command("stats"))
 async def stats_cmd(msg: types.Message):
     if not await is_owner(msg.from_user.id):
+        await msg.reply("âŒ Owner only!")
         return
     
     try:
         stats = await get_bot_stats()
-        text = f"ðŸ“Š Stats\nChats: {stats.get('total_chats', 0)}\nGroups: {stats.get('total_groups', 0)}\nUsers: {stats.get('total_users', 0)}\nGbanned: {stats.get('total_gbanned', 0)}"
-        await msg.reply(text)
+        text = (
+            "ðŸ“Š **Bot Statistics**\n\n"
+            f"ðŸ’¬ Total Chats: {stats.get('total_chats', 0)}\n"
+            f"ðŸ‘¥ Groups: {stats.get('total_groups', 0)}\n"
+            f"ðŸ‘¤ Users: {stats.get('total_users', 0)}\n"
+            f"ðŸš« GBanned: {stats.get('total_gbanned', 0)}\n"
+            f"âš ï¸ Total Warns: {stats.get('total_warns', 0)}\n"
+            f"ðŸ“ Total Logs: {stats.get('total_logs', 0)}"
+        )
+        await msg.reply(text, parse_mode="Markdown")
     except:
-        pass
+        await msg.reply("âŒ Error fetching stats")
 
 @dp.message(Command("gban"))
 async def gban_cmd(msg: types.Message):
-    if not await is_owner(msg.from_user.id) or not msg.reply_to_message or not msg.reply_to_message.from_user:
+    if not await is_owner(msg.from_user.id):
+        return
+    
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await msg.reply("âŒ Reply to a user message to gban them")
         return
     
     try:
         target = msg.reply_to_message.from_user
         await gban_user(target.id, "NSFW ban", msg.from_user.id)
-        await msg.reply(f"âœ… {target.full_name} gbanned")
+        await msg.reply(f"âœ… {target.full_name} globally banned")
     except:
-        pass
+        await msg.reply("âŒ Error")
 
 @dp.message(Command("ungban"))
 async def ungban_cmd(msg: types.Message):
-    if not await is_owner(msg.from_user.id) or not msg.reply_to_message or not msg.reply_to_message.from_user:
+    if not await is_owner(msg.from_user.id):
+        return
+    
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await msg.reply("âŒ Reply to a user message")
         return
     
     try:
@@ -607,26 +675,32 @@ async def ungban_cmd(msg: types.Message):
         if await ungban_user(target.id):
             await msg.reply(f"âœ… {target.full_name} unbanned")
         else:
-            await msg.reply("User not gbanned")
+            await msg.reply("âŒ User not gbanned")
     except:
-        pass
+        await msg.reply("âŒ Error")
 
 @dp.message(Command("warn_status"))
 async def warn_status_cmd(msg: types.Message):
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await msg.reply("âŒ Reply to a user")
         return
     
     try:
         target = msg.reply_to_message.from_user
         doc = await warns_col.find_one({"chat_id": msg.chat.id, "user_id": target.id})
         warns = doc.get("warns", 0) if doc else 0
-        await msg.reply(f"âš ï¸ {target.full_name}: {warns}/{WARN_LIMIT}")
+        await msg.reply(f"âš ï¸ {target.full_name}: {warns}/{WARN_LIMIT} warnings")
     except:
         pass
 
 @dp.message(Command("warn_reset"))
 async def warn_reset_cmd(msg: types.Message):
-    if not await is_user_admin(msg.chat.id, msg.from_user.id) or not msg.reply_to_message or not msg.reply_to_message.from_user:
+    if not await is_user_admin(msg.chat.id, msg.from_user.id):
+        await msg.reply("âŒ Admin only!")
+        return
+    
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await msg.reply("âŒ Reply to a user")
         return
     
     try:
@@ -638,7 +712,12 @@ async def warn_reset_cmd(msg: types.Message):
 
 @dp.message(Command("whitelist_add"))
 async def whitelist_add_cmd(msg: types.Message):
-    if not await is_user_admin(msg.chat.id, msg.from_user.id) or not msg.reply_to_message or not msg.reply_to_message.from_user:
+    if not await is_user_admin(msg.chat.id, msg.from_user.id):
+        await msg.reply("âŒ Admin only!")
+        return
+    
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await msg.reply("âŒ Reply to a user")
         return
     
     try:
@@ -676,7 +755,7 @@ async def handle_sticker(msg: types.Message):
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     
-    logger.info(f"ðŸŽ¨ Sticker - type: {msg.sticker.type}")
+    logger.info(f"ðŸŽ¨ Sticker")
     try:
         ext = ".webm" if msg.sticker.is_video else ".webp"
         async with temporary_download(msg.sticker, ext) as file_path:
@@ -773,13 +852,13 @@ async def setup_database():
     except:
         pass
 
-async def on_startup(bot):
+async def on_startup(bot_instance):
     logger.info("ðŸš€ Bot starting...")
     await setup_database()
     await log_to_channel("âœ… NSFW Bot Started!")
     logger.info("âœ… Ready!")
 
-async def on_shutdown(bot):
+async def on_shutdown(bot_instance):
     logger.info("ðŸ›‘ Shutting down...")
     await log_to_channel("â›” NSFW Bot Offline")
     mongo.close()
