@@ -12,9 +12,9 @@ from typing import Optional, Tuple, List, Dict, Any
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message
 from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
-from aiogram.utils.exceptions import TelegramAPIError
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramAPIError
 from nudenet import NudeClassifier
 from PIL import Image
 import cv2
@@ -36,9 +36,9 @@ VIDEO_FPS = 1
 MUTE_DURATION = 1800  # 30 minutes
 ALLOWED_PRIVATE = False
 
-# Initialize bot and components
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+# Initialize bot with default properties
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
 # Setup logging
 logging.basicConfig(
@@ -111,7 +111,7 @@ async def temporary_download(file_obj, file_extension: str = ""):
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
             temp_path = tmp.name
-            await bot.download_file(file_obj.file_path, temp_path)
+            await bot.download(file_obj.file_path, destination=temp_path)
             temp_file = temp_path
             yield temp_file
     except Exception as e:
@@ -158,8 +158,8 @@ def extract_frames_opencv(video_path: str, out_dir: str, fps: int = 1, max_frame
     frames = []
     try:
         cap = cv2.VideoCapture(video_path)
-        video_fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_interval = int(video_fps / fps) if fps > 0 else 1
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_interval = max(1, int(video_fps / fps)) if fps > 0 else 1
         
         frame_count = 0
         saved_count = 0
@@ -402,7 +402,7 @@ async def handle_detect_and_action(message: Message, file_path: str, origin: str
     if await is_user_gbanned(user_id):
         try:
             await message.delete()
-            await message.answer(f"🚫 User is globally banned and cannot send messages.")
+            await message.answer("🚫 User is globally banned and cannot send messages.")
             return
         except Exception as e:
             logger.error(f"Failed to handle gbanned user: {e}")
@@ -463,7 +463,8 @@ async def take_moderation_action(message: Message, reason: dict, user_id: int, c
         
         # Log to channel
         user_name = message.from_user.full_name if message.from_user else "Unknown"
-        log_message = f"🚫 NSFW Detected\nUser: {user_name} ({user_id})\nChat: {getattr(message.chat, 'title', 'Private')}\nReason: {reason}"
+        chat_title = getattr(message.chat, 'title', 'Private Chat')
+        log_message = f"🚫 NSFW Detected\nUser: {user_name} ({user_id})\nChat: {chat_title}\nReason: {reason}"
         await log_to_channel(log_message)
         
     except TelegramAPIError as e:
@@ -850,14 +851,14 @@ async def setup_database():
     except PyMongoError as e:
         logger.error(f"Failed to create database indexes: {e}")
 
-async def on_startup(bot: Bot):
+async def on_startup():
     """Bot startup tasks"""
     logger.info("Starting moderation bot...")
     await setup_database()
     await log_to_channel("🤖 Bot Started Successfully!")
     logger.info("Bot started successfully")
 
-async def on_shutdown(bot: Bot):
+async def on_shutdown():
     """Bot shutdown tasks"""
     logger.info("Shutting down moderation bot...")
     await log_to_channel("🔴 Bot Shutting Down...")
@@ -866,7 +867,7 @@ async def on_shutdown(bot: Bot):
 
 async def main():
     """Main function"""
-    await on_startup(bot)
+    await on_startup()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
