@@ -409,16 +409,18 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
                 frames = await extract_frames(file_path, tmpdir, fps=VIDEO_FPS, max_frames=MAX_VIDEO_FRAMES)
                 if frames:
                     is_nsfw, reason = await analyze_images(frames)
+                else:
+                    logger.warning("No frames extracted from video")
                     
         elif file_lower.endswith(".webp"):
             logger.info(f"Processing WEBP ({media_type}): {file_path}")
-            # Use PIL-based conversion (more reliable for stickers)
+            # Try PIL conversion for static stickers
             jpg_path = convert_webp_to_jpg_pil(file_path)
             if jpg_path != file_path and os.path.exists(jpg_path):
                 temp_files_to_cleanup.append(jpg_path)
                 is_nsfw, reason = await analyze_images([jpg_path])
             else:
-                # Fallback: try analyzing WEBP directly with PIL
+                # Fallback: analyze WEBP directly with PIL
                 try:
                     with Image.open(file_path) as im:
                         if im.mode in ('RGBA', 'LA', 'P'):
@@ -426,7 +428,6 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
                             background.paste(im, mask=im.split()[-1] if im.mode in ('RGBA', 'LA') else None)
                         else:
                             background = im.convert("RGB")
-                        # Save temp JPG
                         jpg_path = file_path + "_fallback.jpg"
                         background.save(jpg_path, "JPEG", quality=95)
                         temp_files_to_cleanup.append(jpg_path)
@@ -808,8 +809,21 @@ async def handle_sticker(msg: types.Message):
     logger.info(f"Sticker type: {msg.sticker.type}, is_animated: {msg.sticker.is_animated}, is_video: {msg.sticker.is_video}")
     
     try:
-        # Download sticker - Telegram handles format automatically
-        async with temporary_download(msg.sticker, ".webp") as file_path:
+        # Determine correct extension based on sticker type
+        if msg.sticker.is_video:
+            # Video stickers are WEBM format
+            ext = ".webm"
+            logger.info("Video sticker detected - using .webm extension")
+        elif msg.sticker.is_animated:
+            # Animated stickers are TGS format (but Telegram sends as WEBP with animation)
+            ext = ".webp"
+            logger.info("Animated sticker detected - using .webp extension")
+        else:
+            # Static stickers are WEBP format
+            ext = ".webp"
+            logger.info("Static sticker detected - using .webp extension")
+        
+        async with temporary_download(msg.sticker, ext) as file_path:
             if file_path:
                 await handle_detect_and_action(msg, file_path, f"sticker({msg.sticker.type})")
     except Exception as e:
