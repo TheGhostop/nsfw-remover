@@ -28,12 +28,19 @@ DATABASE_NAME = "nsfw_db"
 
 # Bot Settings
 WARN_LIMIT = 3
-NSFW_SKIN_THRESHOLD = 0.3  # 30% - LOWERED for better detection
-NSFW_EDGE_THRESHOLD = 0.6  # Edge detection threshold
 MAX_VIDEO_FRAMES = 6
 VIDEO_FPS = 1
 MUTE_DURATION = 1800
 ALLOWED_PRIVATE = True
+
+# ===== IMPROVED THRESHOLDS (Per image analysis) =====
+# Bikini detection example: 38.7% skin + 49.9% flesh + 61% low_sat = SCORE 6.5
+# Normal sticker example: 57% skin + 44% flesh = SCORE 6.5 (FALSE POSITIVE!)
+# 
+# Solution: Increase required score + stricter combination checks
+NSFW_MIN_SCORE = 5.0          # Require HIGHER score
+NSFW_SKIN_THRESHOLD = 0.35    # 35% skin minimum
+NSFW_FLESH_THRESHOLD = 0.35   # 35% flesh minimum
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -60,12 +67,10 @@ gban_col = db.gban
 chats_col = db.chats
 users_col = db.users
 
-def detect_nsfw_advanced(image_path: str) -> Tuple[bool, Optional[dict]]:
+def detect_nsfw_balanced(image_path: str) -> Tuple[bool, Optional[dict]]:
     """
-    Advanced NSFW detection using multiple methods:
-    1. Skin tone detection (HSV)
-    2. Edge detection for nudity patterns
-    3. Color distribution analysis
+    Balanced NSFW detection with reduced false positives.
+    Uses multiple indicators but requires STRONG evidence.
     """
     try:
         img = cv2.imread(image_path)
@@ -75,10 +80,8 @@ def detect_nsfw_advanced(image_path: str) -> Tuple[bool, Optional[dict]]:
         
         height, width = img.shape[:2]
         
-        # ====== METHOD 1: SKIN TONE DETECTION ======
+        # ====== METHOD 1: SKIN TONE DETECTION (HSV) ======
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        
-        # Broader skin color range (includes various skin tones)
         lower_skin = np.array([0, 15, 60], dtype=np.uint8)
         upper_skin = np.array([25, 255, 255], dtype=np.uint8)
         
@@ -88,32 +91,13 @@ def detect_nsfw_advanced(image_path: str) -> Tuple[bool, Optional[dict]]:
         
         logger.info(f"Skin pixels: {skin_percentage:.2%}")
         
-        # ====== METHOD 2: EDGE DETECTION FOR NUDITY PATTERNS ======
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 100, 200)
-        edge_pixels = cv2.countNonZero(edges)
-        edge_density = edge_pixels / edges.size
-        
-        logger.info(f"Edge density: {edge_density:.2%}")
-        
-        # ====== METHOD 3: COLOR SATURATION (Skin has low saturation) ======
-        # In HSV, S is saturation channel
-        saturation = hsv[:, :, 1]
-        low_sat_pixels = np.sum(saturation < 100)
-        low_sat_percentage = low_sat_pixels / saturation.size
-        
-        logger.info(f"Low saturation (skin-like): {low_sat_percentage:.2%}")
-        
-        # ====== METHOD 4: FLESH TONE DETECTION IN RGB ======
-        # Specific RGB range for human flesh
+        # ====== METHOD 2: FLESH TONE (RGB) ======
         b, g, r = cv2.split(img)
         
-        # Flesh tone ranges
         flesh_mask = cv2.inRange(r, 95, 220) & \
                     cv2.inRange(g, 40, 220) & \
                     cv2.inRange(b, 20, 220)
         
-        # Also check: R > 95, G > 40, B < 85 for darker skin tones
         flesh_mask2 = cv2.inRange(r, 95, 220) & \
                      cv2.inRange(g, 40, 200) & \
                      cv2.inRange(b, 20, 100)
@@ -124,53 +108,69 @@ def detect_nsfw_advanced(image_path: str) -> Tuple[bool, Optional[dict]]:
         
         logger.info(f"Flesh tone pixels: {flesh_percentage:.2%}")
         
-        # ====== DECISION LOGIC ======
-        # Multiple indicators of NSFW:
+        # ====== METHOD 3: EDGE DETECTION ======
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        edge_pixels = cv2.countNonZero(edges)
+        edge_density = edge_pixels / edges.size
+        
+        logger.info(f"Edge density: {edge_density:.2%}")
+        
+        # ====== METHOD 4: COLOR SATURATION ======
+        saturation = hsv[:, :, 1]
+        low_sat_pixels = np.sum(saturation < 100)
+        low_sat_percentage = low_sat_pixels / saturation.size
+        
+        logger.info(f"Low saturation (skin-like): {low_sat_percentage:.2%}")
+        
+        # ====== BALANCED SCORING (STRICTER) ======
         nsfw_score = 0
         reasons = []
         
-        # Check 1: High skin percentage
-        if skin_percentage >= NSFW_SKIN_THRESHOLD:
-            nsfw_score += 2
-            reasons.append(f"High skin tone: {skin_percentage:.1%}")
+        # CONDITION 1: BOTH skin AND flesh must be HIGH (avoid false positives)
+        if skin_percentage >= NSFW_SKIN_THRESHOLD and flesh_percentage >= NSFW_FLESH_THRESHOLD:
+            nsfw_score += 3
+            reasons.append(f"High skin ({skin_percentage:.1%}) AND flesh ({flesh_percentage:.1%})")
+        elif skin_percentage >= 0.5 and flesh_percentage >= 0.5:
+            # Very high combined = strong indicator
+            nsfw_score += 2.5
+            reasons.append(f"Very high skin ({skin_percentage:.1%}) + flesh ({flesh_percentage:.1%})")
         
-        # Check 2: High flesh tone percentage
-        if flesh_percentage >= 0.35:  # 35%
-            nsfw_score += 2
-            reasons.append(f"High flesh tone: {flesh_percentage:.1%}")
-        
-        # Check 3: Skin + Edge combination (smooth skin + body curves)
-        if skin_percentage > 0.25 and edge_density > 0.08:
+        # CONDITION 2: Skin + Edge pattern (curves)
+        if skin_percentage > 0.30 and edge_density > 0.15:
             nsfw_score += 1.5
-            reasons.append(f"Skin + edges (curves): skin={skin_percentage:.1%}, edges={edge_density:.1%}")
+            reasons.append(f"Skin with defined edges (curves): {edge_density:.1%}")
         
-        # Check 4: Low saturation with high flesh (skin characteristics)
-        if low_sat_percentage > 0.5 and flesh_percentage > 0.25:
+        # CONDITION 3: Skin + Low saturation (natural skin look)
+        if skin_percentage > 0.40 and low_sat_percentage > 0.6:
+            nsfw_score += 1.5
+            reasons.append(f"Skin + low saturation (natural skin): {low_sat_percentage:.1%}")
+        
+        # CONDITION 4: Flesh-heavy areas (exposed body parts)
+        if flesh_percentage > 0.50:
             nsfw_score += 1
-            reasons.append(f"Skin characteristics: low_sat={low_sat_percentage:.1%}, flesh={flesh_percentage:.1%}")
+            reasons.append(f"Flesh-heavy image: {flesh_percentage:.1%}")
         
-        # Check 5: Specific color patterns typical of exposed skin
-        if skin_percentage > 0.20 and flesh_percentage > 0.20:
-            nsfw_score += 1.5
-            reasons.append("Combined skin detection")
+        logger.info(f"NSFW Score: {nsfw_score:.1f}")
+        logger.info(f"Reasons: {reasons}")
+        logger.info(f"Threshold: {NSFW_MIN_SCORE}")
         
-        logger.info(f"NSFW Score: {nsfw_score}")
-        logger.info(f"Detection reasons: {reasons}")
-        
-        # NSFW if score >= 3.5
-        if nsfw_score >= 3.5:
+        # ONLY trigger if score is STRONG
+        if nsfw_score >= NSFW_MIN_SCORE:
             return True, {
-                "method": "advanced_detection",
+                "method": "balanced_detection",
                 "score": nsfw_score,
                 "skin_percentage": skin_percentage,
                 "flesh_percentage": flesh_percentage,
+                "edge_density": edge_density,
+                "low_saturation": low_sat_percentage,
                 "reasons": reasons
             }
         
         return False, None
         
     except Exception as e:
-        logger.error(f"Advanced NSFW detection failed: {e}")
+        logger.error(f"NSFW detection failed: {e}")
         return False, None
 
 @asynccontextmanager
@@ -242,14 +242,14 @@ async def analyze_image(image_path: str) -> Tuple[bool, Optional[dict]]:
         return False, None
     
     try:
-        is_nsfw, result = detect_nsfw_advanced(image_path)
+        is_nsfw, result = detect_nsfw_balanced(image_path)
         return is_nsfw, result
     except Exception as e:
         logger.error(f"Image analysis failed: {e}")
         return False, None
 
 async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
-    """Analyze multiple images - return on FIRST NSFW found"""
+    """Analyze multiple images"""
     if not paths:
         return False, None
     
@@ -457,7 +457,7 @@ async def broadcast_message(message: types.Message, forward: bool = False) -> Di
     return stats
 
 async def handle_detect_and_action(message: types.Message, file_path: str, media_type: str = "media"):
-    """Analyze media and take action if NSFW - WITH PROPER CLEANUP"""
+    """Analyze media and take action if NSFW"""
     user_id = message.from_user.id if message.from_user else None
     chat_id = message.chat.id
     
@@ -491,8 +491,6 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
                 frames = await extract_frames(file_path, tmpdir, fps=VIDEO_FPS, max_frames=MAX_VIDEO_FRAMES)
                 if frames:
                     is_nsfw, reason = await analyze_images(frames)
-                else:
-                    logger.warning("No frames extracted from video")
                     
         elif file_lower.endswith(".webp"):
             logger.info(f"Processing WEBP ({media_type}): {file_path}")
@@ -534,7 +532,7 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
                 except:
                     is_nsfw, reason = await analyze_images([file_path])
                     
-        else:  # Image formats
+        else:
             logger.info(f"Processing image ({media_type}): {file_path}")
             is_nsfw, reason = await analyze_images([file_path])
 
@@ -547,12 +545,10 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
     except Exception as e:
         logger.error(f"Error in handle_detect_and_action: {e}")
     finally:
-        # Clean up temp files ONLY for this request
         for temp_file in temp_files_to_cleanup:
             try:
                 if os.path.exists(temp_file):
                     os.unlink(temp_file)
-                    logger.info(f"Cleaned up temp file: {temp_file}")
             except Exception as e:
                 logger.error(f"Cleanup error for {temp_file}: {e}")
 
@@ -649,7 +645,7 @@ async def start_cmd(msg: types.Message):
     welcome_text = (
         "Hello! I am an NSFW Content Moderation Bot.\n\n"
         "Features:\n"
-        "- Advanced NSFW detection in photos, videos, stickers, GIFs\n"
+        "- Smart NSFW detection in photos, videos, stickers\n"
         "- Warn users (3 warnings = mute)\n"
         "- Auto-mute repeat offenders\n"
         "- Global ban system\n\n"
@@ -880,7 +876,6 @@ async def handle_photo(msg: types.Message):
 
 @dp.message(F.sticker)
 async def handle_sticker(msg: types.Message):
-    """Handle all sticker types"""
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
     
