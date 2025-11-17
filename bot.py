@@ -21,7 +21,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
 # Configuration
-BOT_TOKEN = "8498609067:AAFumiioVKuUP-HM9PEC7FveoE9j-2H8rDo"
+BOT_TOKEN = "8395371421:AAHeXyUrhwFf-4WdgLe3eU5xCymdCH1snyA"
 OWNER_IDS = [7641743441, 6361404699]
 LOGGER_GROUP_ID = -1002529491709
 MONGODB_URI = "mongodb+srv://deathhide08:UZYSj9T0VuAgIFAB@cluster0.elg19jx.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
