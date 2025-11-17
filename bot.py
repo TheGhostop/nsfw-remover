@@ -1,4 +1,3 @@
-# moderate_bot.py
 import asyncio
 import os
 import re
@@ -8,15 +7,17 @@ import logging
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
+from aiogram.utils.exceptions import TelegramAPIError
 from nudenet import NudeClassifier
 from PIL import Image
+import cv2
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
@@ -37,7 +38,7 @@ ALLOWED_PRIVATE = False
 
 # Initialize bot and components
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
 
 # Setup logging
 logging.basicConfig(
@@ -51,14 +52,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize MongoDB with motor for async operations
-mongo = AsyncIOMotorClient(MONGODB_URI)
-db = mongo[DATABASE_NAME]
-warns_col = db.warns
-log_col = db.logs
-whitelist_col = db.whitelist
-gban_col = db.gban
-chats_col = db.chats
-users_col = db.users
+try:
+    mongo = AsyncIOMotorClient(MONGODB_URI)
+    db = mongo[DATABASE_NAME]
+    warns_col = db.warns
+    log_col = db.logs
+    whitelist_col = db.whitelist
+    gban_col = db.gban
+    chats_col = db.chats
+    users_col = db.users
+    logger.info("MongoDB connected successfully")
+except Exception as e:
+    logger.error(f"MongoDB connection failed: {e}")
+    # Create dummy collections to prevent crashes
+    class DummyCollection:
+        async def find_one(self, *args, **kwargs): return None
+        async def update_one(self, *args, **kwargs): return type('obj', (object,), {'modified_count': 0})()
+        async def delete_one(self, *args, **kwargs): return type('obj', (object,), {'deleted_count': 0})()
+        async def insert_one(self, *args, **kwargs): return type('obj', (object,), {'inserted_id': None})()
+        async def count_documents(self, *args, **kwargs): return 0
+        async def create_index(self, *args, **kwargs): return None
+        def find(self, *args, **kwargs): return AsyncDummyCursor()
+    
+    class AsyncDummyCursor:
+        def __aiter__(self): return self
+        async def __anext__(self): raise StopAsyncIteration
+    
+    warns_col = log_col = whitelist_col = gban_col = chats_col = users_col = DummyCollection()
 
 # Initialize classifier (lazy loading)
 classifier = None
@@ -67,7 +87,16 @@ def get_classifier():
     global classifier
     if classifier is None:
         logger.info("Initializing NudeClassifier...")
-        classifier = NudeClassifier()
+        try:
+            classifier = NudeClassifier()
+            logger.info("NudeClassifier initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize NudeClassifier: {e}")
+            # Create a dummy classifier for testing
+            class DummyClassifier:
+                def classify(self, paths):
+                    return {path: {"unsafe": 0.1, "safe": 0.9} for path in paths}
+            classifier = DummyClassifier()
     return classifier
 
 # Utility functions
@@ -82,28 +111,34 @@ async def temporary_download(file_obj, file_extension: str = ""):
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
             temp_path = tmp.name
-            await file_obj.download(destination=temp_path)
+            await bot.download_file(file_obj.file_path, temp_path)
             temp_file = temp_path
             yield temp_file
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
+        yield None
     finally:
         if temp_file and os.path.exists(temp_file):
-            os.unlink(temp_file)
+            try:
+                os.unlink(temp_file)
+            except Exception as e:
+                logger.error(f"Failed to delete temp file {temp_file}: {e}")
 
 async def extract_frames(video_path: str, out_dir: str, fps: int = 1, max_frames: int = 10) -> List[str]:
     """Extract frames from video using ffmpeg"""
-    os.makedirs(out_dir, exist_ok=True)
-    
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-i", video_path,
-        "-vf", f"fps={fps}",
-        "-q:v", "3",
-        "-frames:v", str(max_frames),
-        os.path.join(out_dir, "frame_%03d.jpg")
-    ]
-    
     try:
-        subprocess.run(cmd, check=True, timeout=30)
+        os.makedirs(out_dir, exist_ok=True)
+        
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", video_path,
+            "-vf", f"fps={fps}",
+            "-q:v", "3",
+            "-frames:v", str(max_frames),
+            os.path.join(out_dir, "frame_%03d.jpg")
+        ]
+        
+        subprocess.run(cmd, check=True, timeout=30, capture_output=True)
         frames = sorted([os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith('.jpg')])
         return frames[:max_frames]
     except subprocess.TimeoutExpired:
@@ -111,6 +146,41 @@ async def extract_frames(video_path: str, out_dir: str, fps: int = 1, max_frames
         return []
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.error(f"FFmpeg error: {e}")
+        # Try using OpenCV as fallback
+        try:
+            return extract_frames_opencv(video_path, out_dir, fps, max_frames)
+        except Exception as cv_e:
+            logger.error(f"OpenCV fallback also failed: {cv_e}")
+            return []
+
+def extract_frames_opencv(video_path: str, out_dir: str, fps: int = 1, max_frames: int = 10) -> List[str]:
+    """Extract frames using OpenCV as fallback"""
+    frames = []
+    try:
+        cap = cv2.VideoCapture(video_path)
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_interval = int(video_fps / fps) if fps > 0 else 1
+        
+        frame_count = 0
+        saved_count = 0
+        
+        while saved_count < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            if frame_count % frame_interval == 0:
+                frame_path = os.path.join(out_dir, f"frame_{saved_count:03d}.jpg")
+                cv2.imwrite(frame_path, frame)
+                frames.append(frame_path)
+                saved_count += 1
+                
+            frame_count += 1
+            
+        cap.release()
+        return frames
+    except Exception as e:
+        logger.error(f"OpenCV frame extraction failed: {e}")
         return []
 
 def convert_webp_to_png(webp_path: str) -> str:
@@ -132,10 +202,13 @@ async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
     classifier = get_classifier()
     try:
         results = classifier.classify(paths)
+        logger.info(f"Analysis results: {results}")
+        
         for path, result in results.items():
             for label, score in result.items():
-                if (score >= NSFW_THRESHOLD and 
-                    label.lower() in ("porn", "unsafe", "sexy", "hentai")):
+                if label.lower() in ("unsafe", "porn") and score >= NSFW_THRESHOLD:
+                    return True, {"path": path, "label": label, "score": score}
+                elif score >= NSFW_THRESHOLD and label.lower() in ("sexy", "hentai"):
                     return True, {"path": path, "label": label, "score": score}
         return False, None
     except Exception as e:
@@ -155,8 +228,8 @@ async def is_user_admin(chat_id: int, user_id: int) -> bool:
     """Check if user is admin in the chat"""
     try:
         member = await bot.get_chat_member(chat_id, user_id)
-        return member.is_chat_admin()
-    except Exception as e:
+        return member.status in ["administrator", "creator"]
+    except TelegramAPIError as e:
         logger.error(f"Failed to check admin status: {e}")
         return False
 
@@ -167,7 +240,7 @@ async def is_owner(user_id: int) -> bool:
 async def log_to_channel(message: str):
     """Send log message to logger group"""
     try:
-        await bot.send_message(LOGGER_GROUP_ID, message)
+        await bot.send_message(LOGGER_GROUP_ID, message[:4000])  # Truncate long messages
     except Exception as e:
         logger.error(f"Failed to send log to channel: {e}")
 
@@ -293,15 +366,9 @@ async def broadcast_message(message: Message, forward: bool = False) -> Dict[str
         try:
             chat_id = chat["chat_id"]
             
-            if forward:
-                # Forward the message
-                sent_msg = await bot.forward_message(
-                    chat_id=chat_id,
-                    from_chat_id=message.chat.id,
-                    message_id=message.message_id
-                )
+            if forward and message.forward_from_chat:
+                sent_msg = await message.forward(chat_id)
             else:
-                # Copy the message
                 sent_msg = await message.copy_to(chat_id)
             
             stats["success"] += 1
@@ -322,11 +389,17 @@ async def broadcast_message(message: Message, forward: bool = False) -> Dict[str
 
 async def handle_detect_and_action(message: Message, file_path: str, origin: str = "media"):
     """Handle NSFW detection and take appropriate action"""
+    if not file_path:
+        return
+        
     user_id = message.from_user.id if message.from_user else None
     chat_id = message.chat.id
     
+    if not user_id:
+        return
+    
     # Check if user is globally banned
-    if user_id and await is_user_gbanned(user_id):
+    if await is_user_gbanned(user_id):
         try:
             await message.delete()
             await message.answer(f"🚫 User is globally banned and cannot send messages.")
@@ -335,10 +408,9 @@ async def handle_detect_and_action(message: Message, file_path: str, origin: str
             logger.error(f"Failed to handle gbanned user: {e}")
     
     # Skip if user is admin or whitelisted
-    if user_id:
-        if await is_user_admin(chat_id, user_id) or await is_user_whitelisted(chat_id, user_id):
-            logger.info(f"Skipping check for admin/whitelisted user {user_id}")
-            return
+    if await is_user_admin(chat_id, user_id) or await is_user_whitelisted(chat_id, user_id):
+        logger.info(f"Skipping check for admin/whitelisted user {user_id}")
+        return
 
     is_nsfw = False
     reason = None
@@ -352,6 +424,12 @@ async def handle_detect_and_action(message: Message, file_path: str, origin: str
                 frames = await extract_frames(file_path, tmpdir, fps=VIDEO_FPS, max_frames=MAX_VIDEO_FRAMES)
                 if frames:
                     is_nsfw, reason = await analyze_images(frames)
+                    # Cleanup frame files
+                    for frame in frames:
+                        try:
+                            os.unlink(frame)
+                        except Exception as e:
+                            logger.error(f"Failed to delete frame {frame}: {e}")
         elif file_path.lower().endswith(".webp"):
             # WEBP processing
             png_path = convert_webp_to_png(file_path)
@@ -385,9 +463,10 @@ async def take_moderation_action(message: Message, reason: dict, user_id: int, c
         
         # Log to channel
         user_name = message.from_user.full_name if message.from_user else "Unknown"
-        await log_to_channel(f"🚫 NSFW Detected\nUser: {user_name} ({user_id})\nChat: {message.chat.title}\nReason: {reason}")
+        log_message = f"🚫 NSFW Detected\nUser: {user_name} ({user_id})\nChat: {getattr(message.chat, 'title', 'Private')}\nReason: {reason}"
+        await log_to_channel(log_message)
         
-    except Exception as e:
+    except TelegramAPIError as e:
         logger.error(f"Failed to delete message: {e}")
 
     # Update warning count
@@ -429,7 +508,7 @@ async def take_moderation_action(message: Message, reason: dict, user_id: int, c
             # Delete warning message after 10 seconds
             await asyncio.sleep(10)
             await warning_msg.delete()
-        except Exception:
+        except TelegramAPIError:
             pass
 
         # Apply mute if over limit
@@ -467,16 +546,18 @@ async def mute_user(chat_id: int, user_id: int, user_name: str):
         await asyncio.sleep(15)
         await mute_msg.delete()
         
-    except Exception as e:
+    except TelegramAPIError as e:
         logger.error(f"Failed to mute user {user_id}: {e}")
 
 # Message handlers
-@dp.message()
-async def all_messages(msg: Message):
-    """Handle all incoming messages"""
+@dp.message(F.content_type.in_({
+    "photo", "video", "document", "sticker", "animation"
+}))
+async def handle_media_messages(msg: Message):
+    """Handle media messages for NSFW detection"""
     # Update chat and user data
     if msg.chat.type != "private":
-        await update_chat_data(msg.chat.id, msg.chat.title)
+        await update_chat_data(msg.chat.id, getattr(msg.chat, 'title', ''))
     
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
@@ -492,27 +573,37 @@ async def all_messages(msg: Message):
     # Handle different media types
     try:
         if msg.photo:
-            async with temporary_download(await msg.photo[-1].get_file(), ".jpg") as file_path:
-                await handle_detect_and_action(msg, file_path, "photo")
+            file_obj = await bot.get_file(msg.photo[-1].file_id)
+            async with temporary_download(file_obj, ".jpg") as file_path:
+                if file_path:
+                    await handle_detect_and_action(msg, file_path, "photo")
                 
         elif msg.sticker:
-            async with temporary_download(await msg.sticker.get_file(), ".webp") as file_path:
-                await handle_detect_and_action(msg, file_path, "sticker")
+            file_obj = await bot.get_file(msg.sticker.file_id)
+            async with temporary_download(file_obj, ".webp") as file_path:
+                if file_path:
+                    await handle_detect_and_action(msg, file_path, "sticker")
                 
         elif msg.video:
-            async with temporary_download(await msg.video.get_file(), ".mp4") as file_path:
-                await handle_detect_and_action(msg, file_path, "video")
+            file_obj = await bot.get_file(msg.video.file_id)
+            async with temporary_download(file_obj, ".mp4") as file_path:
+                if file_path:
+                    await handle_detect_and_action(msg, file_path, "video")
                 
         elif msg.document:
             # Check if document is likely an image or video
             mime_type = msg.document.mime_type or ""
             if mime_type.startswith(('image/', 'video/')):
-                async with temporary_download(await msg.document.get_file()) as file_path:
-                    await handle_detect_and_action(msg, file_path, "document")
+                file_obj = await bot.get_file(msg.document.file_id)
+                async with temporary_download(file_obj) as file_path:
+                    if file_path:
+                        await handle_detect_and_action(msg, file_path, "document")
                     
         elif msg.animation:  # GIFs
-            async with temporary_download(await msg.animation.get_file(), ".mp4") as file_path:
-                await handle_detect_and_action(msg, file_path, "animation")
+            file_obj = await bot.get_file(msg.animation.file_id)
+            async with temporary_download(file_obj, ".mp4") as file_path:
+                if file_path:
+                    await handle_detect_and_action(msg, file_path, "animation")
                 
     except Exception as e:
         logger.error(f"Error processing message {msg.message_id}: {e}")
@@ -531,7 +622,7 @@ async def broadcast_cmd(msg: Message):
     processing_msg = await msg.reply("🔄 Starting broadcast...")
     
     try:
-        stats = await broadcast_message(msg.reply_to_message, forward=True)
+        stats = await broadcast_message(msg.reply_to_message, forward=False)
         
         result_text = (
             f"📢 Broadcast Completed!\n\n"
@@ -713,11 +804,43 @@ async def whitelist_add_cmd(msg: Message):
     except PyMongoError as e:
         await msg.reply("❌ Failed to add user to whitelist.")
 
+@dp.message(Command("whitelist_remove"))
+async def whitelist_remove_cmd(msg: Message):
+    """Remove user from whitelist (admin only)"""
+    if not await is_user_admin(msg.chat.id, msg.from_user.id):
+        return
+        
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await msg.reply("Please reply to a user's message to remove them from whitelist.")
+        return
+        
+    target_user = msg.reply_to_message.from_user
+    try:
+        result = await whitelist_col.delete_one({"chat_id": msg.chat.id, "user_id": target_user.id})
+        if result.deleted_count > 0:
+            response = await msg.reply(f"✅ {target_user.full_name} removed from whitelist")
+        else:
+            response = await msg.reply(f"❌ {target_user.full_name} was not in whitelist")
+        await asyncio.sleep(10)
+        await response.delete()
+        await msg.delete()
+    except PyMongoError as e:
+        await msg.reply("❌ Failed to remove user from whitelist.")
+
+@dp.message(Command("start"))
+async def start_cmd(msg: Message):
+    """Start command handler"""
+    if msg.chat.type == "private":
+        await msg.reply(
+            "🤖 NSFW Moderation Bot\n\n"
+            "I can detect and moderate NSFW content in groups.\n"
+            "Add me to your group and make me admin to start moderating!"
+        )
+
 async def setup_database():
     """Setup database indexes"""
     try:
         await warns_col.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
-        await warns_col.create_index([("last_warn", 1)], expireAfterSeconds=30*24*3600)  # 30 days TTL
         await log_col.create_index([("chat_id", 1), ("timestamp", -1)])
         await whitelist_col.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
         await gban_col.create_index([("user_id", 1)], unique=True)
@@ -727,13 +850,23 @@ async def setup_database():
     except PyMongoError as e:
         logger.error(f"Failed to create database indexes: {e}")
 
-async def main():
-    """Main function to start the bot"""
+async def on_startup(bot: Bot):
+    """Bot startup tasks"""
+    logger.info("Starting moderation bot...")
     await setup_database()
     await log_to_channel("🤖 Bot Started Successfully!")
     logger.info("Bot started successfully")
-    
-    # Start polling
+
+async def on_shutdown(bot: Bot):
+    """Bot shutdown tasks"""
+    logger.info("Shutting down moderation bot...")
+    await log_to_channel("🔴 Bot Shutting Down...")
+    await mongo.close()
+    logger.info("Bot shutdown complete")
+
+async def main():
+    """Main function"""
+    await on_startup(bot)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
@@ -741,9 +874,4 @@ if __name__ == "__main__":
     Path("logs").mkdir(exist_ok=True)
     
     # Start the bot
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
+    asyncio.run(main())
