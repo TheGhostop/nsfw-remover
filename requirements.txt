@@ -1,6 +1,9 @@
-aiogram
-nudenet
-pillow
-motor
-pymongo
-python-dotenv
+aiogram==3.17
+nudenet==2.0.2
+Pillow==10.4.0
+motor==3.5.0
+pymongo==4.9.0
+ffmpeg-python==0.2.0
+aiofiles==24.0.0
+opencv-python==4.10.0.84
+numpy==1.26.4
