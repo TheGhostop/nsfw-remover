@@ -28,7 +28,8 @@ DATABASE_NAME = "nsfw_db"
 
 # Bot Settings
 WARN_LIMIT = 3
-NSFW_THRESHOLD = 0.5
+NSFW_SKIN_THRESHOLD = 0.3  # 30% - LOWERED for better detection
+NSFW_EDGE_THRESHOLD = 0.6  # Edge detection threshold
 MAX_VIDEO_FRAMES = 6
 VIDEO_FPS = 1
 MUTE_DURATION = 1800
@@ -59,36 +60,117 @@ gban_col = db.gban
 chats_col = db.chats
 users_col = db.users
 
-def detect_nsfw_opencv(image_path: str) -> Tuple[bool, Optional[dict]]:
-    """Detect NSFW using OpenCV skin detection"""
+def detect_nsfw_advanced(image_path: str) -> Tuple[bool, Optional[dict]]:
+    """
+    Advanced NSFW detection using multiple methods:
+    1. Skin tone detection (HSV)
+    2. Edge detection for nudity patterns
+    3. Color distribution analysis
+    """
     try:
         img = cv2.imread(image_path)
         if img is None:
             logger.warning(f"Could not read image: {image_path}")
             return False, None
         
-        # Convert to HSV for skin detection
+        height, width = img.shape[:2]
+        
+        # ====== METHOD 1: SKIN TONE DETECTION ======
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
-        # Skin color range in HSV
-        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
-        upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+        # Broader skin color range (includes various skin tones)
+        lower_skin = np.array([0, 15, 60], dtype=np.uint8)
+        upper_skin = np.array([25, 255, 255], dtype=np.uint8)
         
-        mask = cv2.inRange(hsv, lower_skin, upper_skin)
+        mask_skin = cv2.inRange(hsv, lower_skin, upper_skin)
+        skin_pixels = cv2.countNonZero(mask_skin)
+        skin_percentage = skin_pixels / mask_skin.size
         
-        total_pixels = mask.size
-        skin_pixels = cv2.countNonZero(mask)
-        skin_percentage = skin_pixels / total_pixels
+        logger.info(f"Skin pixels: {skin_percentage:.2%}")
         
-        logger.info(f"Skin detection: {skin_percentage:.2%} of image is skin-colored")
+        # ====== METHOD 2: EDGE DETECTION FOR NUDITY PATTERNS ======
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        edge_pixels = cv2.countNonZero(edges)
+        edge_density = edge_pixels / edges.size
         
-        if skin_percentage >= NSFW_THRESHOLD:
-            return True, {"method": "skin_detection", "skin_percentage": skin_percentage}
+        logger.info(f"Edge density: {edge_density:.2%}")
+        
+        # ====== METHOD 3: COLOR SATURATION (Skin has low saturation) ======
+        # In HSV, S is saturation channel
+        saturation = hsv[:, :, 1]
+        low_sat_pixels = np.sum(saturation < 100)
+        low_sat_percentage = low_sat_pixels / saturation.size
+        
+        logger.info(f"Low saturation (skin-like): {low_sat_percentage:.2%}")
+        
+        # ====== METHOD 4: FLESH TONE DETECTION IN RGB ======
+        # Specific RGB range for human flesh
+        b, g, r = cv2.split(img)
+        
+        # Flesh tone ranges
+        flesh_mask = cv2.inRange(r, 95, 220) & \
+                    cv2.inRange(g, 40, 220) & \
+                    cv2.inRange(b, 20, 220)
+        
+        # Also check: R > 95, G > 40, B < 85 for darker skin tones
+        flesh_mask2 = cv2.inRange(r, 95, 220) & \
+                     cv2.inRange(g, 40, 200) & \
+                     cv2.inRange(b, 20, 100)
+        
+        combined_flesh = cv2.bitwise_or(flesh_mask, flesh_mask2)
+        flesh_pixels = cv2.countNonZero(combined_flesh)
+        flesh_percentage = flesh_pixels / combined_flesh.size
+        
+        logger.info(f"Flesh tone pixels: {flesh_percentage:.2%}")
+        
+        # ====== DECISION LOGIC ======
+        # Multiple indicators of NSFW:
+        nsfw_score = 0
+        reasons = []
+        
+        # Check 1: High skin percentage
+        if skin_percentage >= NSFW_SKIN_THRESHOLD:
+            nsfw_score += 2
+            reasons.append(f"High skin tone: {skin_percentage:.1%}")
+        
+        # Check 2: High flesh tone percentage
+        if flesh_percentage >= 0.35:  # 35%
+            nsfw_score += 2
+            reasons.append(f"High flesh tone: {flesh_percentage:.1%}")
+        
+        # Check 3: Skin + Edge combination (smooth skin + body curves)
+        if skin_percentage > 0.25 and edge_density > 0.08:
+            nsfw_score += 1.5
+            reasons.append(f"Skin + edges (curves): skin={skin_percentage:.1%}, edges={edge_density:.1%}")
+        
+        # Check 4: Low saturation with high flesh (skin characteristics)
+        if low_sat_percentage > 0.5 and flesh_percentage > 0.25:
+            nsfw_score += 1
+            reasons.append(f"Skin characteristics: low_sat={low_sat_percentage:.1%}, flesh={flesh_percentage:.1%}")
+        
+        # Check 5: Specific color patterns typical of exposed skin
+        if skin_percentage > 0.20 and flesh_percentage > 0.20:
+            nsfw_score += 1.5
+            reasons.append("Combined skin detection")
+        
+        logger.info(f"NSFW Score: {nsfw_score}")
+        logger.info(f"Detection reasons: {reasons}")
+        
+        # NSFW if score >= 3.5
+        if nsfw_score >= 3.5:
+            return True, {
+                "method": "advanced_detection",
+                "score": nsfw_score,
+                "skin_percentage": skin_percentage,
+                "flesh_percentage": flesh_percentage,
+                "reasons": reasons
+            }
         
         return False, None
         
     except Exception as e:
-        logger.error(f"OpenCV NSFW detection failed: {e}")
+        logger.error(f"Advanced NSFW detection failed: {e}")
         return False, None
 
 @asynccontextmanager
@@ -114,12 +196,10 @@ async def temporary_download(downloadable, file_extension: str = ""):
                 logger.error(f"Failed to delete temp file {temp_file}: {e}")
 
 def convert_webp_to_jpg_pil(webp_path: str) -> str:
-    """Convert WEBP to JPG using PIL directly"""
+    """Convert WEBP to JPG using PIL"""
     jpg_path = webp_path.replace('.webp', '.jpg')
     try:
-        # Open WEBP and convert to RGB
         with Image.open(webp_path) as im:
-            # Convert RGBA to RGB if needed
             if im.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', im.size, (255, 255, 255))
                 background.paste(im, mask=im.split()[-1] if im.mode in ('RGBA', 'LA') else None)
@@ -162,26 +242,28 @@ async def analyze_image(image_path: str) -> Tuple[bool, Optional[dict]]:
         return False, None
     
     try:
-        is_nsfw, result = detect_nsfw_opencv(image_path)
+        is_nsfw, result = detect_nsfw_advanced(image_path)
         return is_nsfw, result
     except Exception as e:
         logger.error(f"Image analysis failed: {e}")
         return False, None
 
 async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
-    """Analyze multiple images"""
+    """Analyze multiple images - return on FIRST NSFW found"""
     if not paths:
         return False, None
     
     try:
         logger.info(f"Analyzing {len(paths)} image(s) for NSFW content...")
         
-        for path in paths:
+        for idx, path in enumerate(paths, 1):
+            logger.info(f"Analyzing frame {idx}/{len(paths)}: {path}")
             is_nsfw, result = await analyze_image(path)
             if is_nsfw:
-                logger.warning(f"NSFW detected in {path}: {result}")
+                logger.warning(f"NSFW DETECTED in frame {idx}! Details: {result}")
                 return True, result
         
+        logger.info(f"All {len(paths)} frame(s) analyzed - SAFE")
         return False, None
     except Exception as e:
         logger.error(f"Batch image analysis failed: {e}")
@@ -375,7 +457,7 @@ async def broadcast_message(message: types.Message, forward: bool = False) -> Di
     return stats
 
 async def handle_detect_and_action(message: types.Message, file_path: str, media_type: str = "media"):
-    """Analyze media and take action if NSFW"""
+    """Analyze media and take action if NSFW - WITH PROPER CLEANUP"""
     user_id = message.from_user.id if message.from_user else None
     chat_id = message.chat.id
     
@@ -414,13 +496,11 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
                     
         elif file_lower.endswith(".webp"):
             logger.info(f"Processing WEBP ({media_type}): {file_path}")
-            # Try PIL conversion for static stickers
             jpg_path = convert_webp_to_jpg_pil(file_path)
             if jpg_path != file_path and os.path.exists(jpg_path):
                 temp_files_to_cleanup.append(jpg_path)
                 is_nsfw, reason = await analyze_images([jpg_path])
             else:
-                # Fallback: analyze WEBP directly with PIL
                 try:
                     with Image.open(file_path) as im:
                         if im.mode in ('RGBA', 'LA', 'P'):
@@ -462,15 +542,17 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
             logger.warning(f"NSFW content detected! Reason: {reason}")
             await take_moderation_action(message, reason, user_id, chat_id)
         else:
-            logger.info(f"Content is safe")
+            logger.info(f"Content is safe - no action taken")
             
     except Exception as e:
         logger.error(f"Error in handle_detect_and_action: {e}")
     finally:
+        # Clean up temp files ONLY for this request
         for temp_file in temp_files_to_cleanup:
             try:
                 if os.path.exists(temp_file):
                     os.unlink(temp_file)
+                    logger.info(f"Cleaned up temp file: {temp_file}")
             except Exception as e:
                 logger.error(f"Cleanup error for {temp_file}: {e}")
 
@@ -567,7 +649,7 @@ async def start_cmd(msg: types.Message):
     welcome_text = (
         "Hello! I am an NSFW Content Moderation Bot.\n\n"
         "Features:\n"
-        "- Auto-detect NSFW in photos, videos, stickers, GIFs\n"
+        "- Advanced NSFW detection in photos, videos, stickers, GIFs\n"
         "- Warn users (3 warnings = mute)\n"
         "- Auto-mute repeat offenders\n"
         "- Global ban system\n\n"
@@ -798,7 +880,7 @@ async def handle_photo(msg: types.Message):
 
 @dp.message(F.sticker)
 async def handle_sticker(msg: types.Message):
-    """Handle all sticker types - static, animated, video"""
+    """Handle all sticker types"""
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
     
@@ -809,17 +891,13 @@ async def handle_sticker(msg: types.Message):
     logger.info(f"Sticker type: {msg.sticker.type}, is_animated: {msg.sticker.is_animated}, is_video: {msg.sticker.is_video}")
     
     try:
-        # Determine correct extension based on sticker type
         if msg.sticker.is_video:
-            # Video stickers are WEBM format
             ext = ".webm"
             logger.info("Video sticker detected - using .webm extension")
         elif msg.sticker.is_animated:
-            # Animated stickers are TGS format (but Telegram sends as WEBP with animation)
             ext = ".webp"
             logger.info("Animated sticker detected - using .webp extension")
         else:
-            # Static stickers are WEBP format
             ext = ".webp"
             logger.info("Static sticker detected - using .webp extension")
         
