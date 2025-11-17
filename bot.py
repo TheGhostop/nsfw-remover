@@ -852,7 +852,8 @@ async def setup_database():
     except:
         pass
 
-async def on_startup(bot_instance):
+async def on_startup(bot, **kwargs):
+    # your initialization code here
     logger.info("ðŸš€ Bot starting...")
     await setup_database()
     await log_to_channel("âœ… NSFW Bot Started!")
