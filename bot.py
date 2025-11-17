@@ -31,10 +31,13 @@ WARN_LIMIT = 3
 MAX_VIDEO_FRAMES = 6
 VIDEO_FPS = 1
 MUTE_DURATION = 1800
-ALLOWED_PRIVATE = True
 
-# Thresholds
-NSFW_MIN_SCORE = 5.0
+# ===== IMPROVED THRESHOLDS =====
+# Log analysis: 95% skin, 76% flesh = Score 4.0 (not detected!)
+# ISSUE: Threshold too high, and skin-only not counted enough
+#
+# Fix: Lower threshold + Better skin-only scoring
+NSFW_MIN_SCORE = 4.0           # LOWERED from 5.0 (more aggressive)
 NSFW_SKIN_THRESHOLD = 0.35
 NSFW_FLESH_THRESHOLD = 0.35
 
@@ -63,15 +66,15 @@ gban_col = db.gban
 chats_col = db.chats
 users_col = db.users
 
-def detect_nsfw_balanced(image_path: str) -> Tuple[bool, Optional[dict]]:
-    """Balanced NSFW detection"""
+def detect_nsfw_improved(image_path: str) -> Tuple[bool, Optional[dict]]:
+    """
+    Improved NSFW detection with better high-skin scoring
+    """
     try:
         img = cv2.imread(image_path)
         if img is None:
             logger.warning(f"Could not read image: {image_path}")
             return False, None
-        
-        height, width = img.shape[:2]
         
         # ====== METHOD 1: SKIN TONE DETECTION (HSV) ======
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -116,32 +119,44 @@ def detect_nsfw_balanced(image_path: str) -> Tuple[bool, Optional[dict]]:
         
         logger.info(f"Low saturation (skin-like): {low_sat_percentage:.2%}")
         
-        # ====== BALANCED SCORING ======
+        # ====== IMPROVED SCORING ======
         nsfw_score = 0
         reasons = []
         
-        # CONDITION 1: BOTH skin AND flesh must be HIGH
+        # MAIN: Both skin AND flesh high
         if skin_percentage >= NSFW_SKIN_THRESHOLD and flesh_percentage >= NSFW_FLESH_THRESHOLD:
             nsfw_score += 3
             reasons.append(f"High skin ({skin_percentage:.1%}) AND flesh ({flesh_percentage:.1%})")
-        elif skin_percentage >= 0.5 and flesh_percentage >= 0.5:
-            nsfw_score += 2.5
-            reasons.append(f"Very high skin ({skin_percentage:.1%}) + flesh ({flesh_percentage:.1%})")
         
-        # CONDITION 2: Skin + Edge pattern
+        # VERY HIGH: Extreme skin percentage (like 95%+)
+        if skin_percentage >= 0.85:
+            nsfw_score += 2.5
+            reasons.append(f"Extreme skin tone: {skin_percentage:.1%}")
+        
+        # HIGH: Both above 50%
+        elif skin_percentage >= 0.50 and flesh_percentage >= 0.50:
+            nsfw_score += 2
+            reasons.append(f"High skin ({skin_percentage:.1%}) + flesh ({flesh_percentage:.1%})")
+        
+        # SKIN HEAVY: Very high skin alone
+        if skin_percentage >= 0.70:
+            nsfw_score += 1.5
+            reasons.append(f"Very high skin coverage: {skin_percentage:.1%}")
+        
+        # FLESH HEAVY: High flesh area
+        if flesh_percentage > 0.50:
+            nsfw_score += 1
+            reasons.append(f"Flesh-heavy image: {flesh_percentage:.1%}")
+        
+        # Skin + Edge (body curves)
         if skin_percentage > 0.30 and edge_density > 0.15:
             nsfw_score += 1.5
             reasons.append(f"Skin with defined edges (curves): {edge_density:.1%}")
         
-        # CONDITION 3: Skin + Low saturation
+        # Skin + Natural look (low saturation)
         if skin_percentage > 0.40 and low_sat_percentage > 0.6:
             nsfw_score += 1.5
             reasons.append(f"Skin + low saturation (natural skin): {low_sat_percentage:.1%}")
-        
-        # CONDITION 4: Flesh-heavy areas
-        if flesh_percentage > 0.50:
-            nsfw_score += 1
-            reasons.append(f"Flesh-heavy image: {flesh_percentage:.1%}")
         
         logger.info(f"NSFW Score: {nsfw_score:.1f}")
         logger.info(f"Reasons: {reasons}")
@@ -149,12 +164,10 @@ def detect_nsfw_balanced(image_path: str) -> Tuple[bool, Optional[dict]]:
         
         if nsfw_score >= NSFW_MIN_SCORE:
             return True, {
-                "method": "balanced_detection",
+                "method": "improved_detection",
                 "score": nsfw_score,
                 "skin_percentage": skin_percentage,
                 "flesh_percentage": flesh_percentage,
-                "edge_density": edge_density,
-                "low_saturation": low_sat_percentage,
                 "reasons": reasons
             }
         
@@ -220,11 +233,7 @@ async def extract_frames(video_path: str, out_dir: str, fps: int = 1, max_frames
         frames = sorted([os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith('.jpg')])
         logger.info(f"Extracted {len(frames)} frames from video")
         return frames[:max_frames]
-    except subprocess.TimeoutExpired:
-        logger.error("FFmpeg timeout while extracting frames")
-        return []
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        logger.error(f"FFmpeg error: {e}")
+    except:
         return []
 
 async def analyze_image(image_path: str) -> Tuple[bool, Optional[dict]]:
@@ -233,7 +242,7 @@ async def analyze_image(image_path: str) -> Tuple[bool, Optional[dict]]:
         return False, None
     
     try:
-        is_nsfw, result = detect_nsfw_balanced(image_path)
+        is_nsfw, result = detect_nsfw_improved(image_path)
         return is_nsfw, result
     except Exception as e:
         logger.error(f"Image analysis failed: {e}")
@@ -248,32 +257,29 @@ async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
         logger.info(f"Analyzing {len(paths)} image(s) for NSFW content...")
         
         for idx, path in enumerate(paths, 1):
-            logger.info(f"Analyzing frame {idx}/{len(paths)}: {path}")
             is_nsfw, result = await analyze_image(path)
             if is_nsfw:
-                logger.warning(f"NSFW DETECTED in frame {idx}! Details: {result}")
+                logger.warning(f"NSFW DETECTED in frame {idx}!")
                 return True, result
         
         logger.info(f"All {len(paths)} frame(s) analyzed - SAFE")
         return False, None
     except Exception as e:
-        logger.error(f"Batch image analysis failed: {e}")
+        logger.error(f"Batch analysis failed: {e}")
         return False, None
 
 async def is_user_whitelisted(chat_id: int, user_id: int) -> bool:
     try:
         doc = await whitelist_col.find_one({"chat_id": chat_id, "user_id": user_id})
         return doc is not None
-    except PyMongoError as e:
-        logger.error(f"Database error checking whitelist: {e}")
+    except:
         return False
 
 async def is_user_admin(chat_id: int, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         return member.status in ["creator", "administrator"]
-    except TelegramAPIError as e:
-        logger.error(f"Failed to check admin status: {e}")
+    except:
         return False
 
 async def is_owner(user_id: int) -> bool:
@@ -282,50 +288,37 @@ async def is_owner(user_id: int) -> bool:
 async def log_to_channel(message: str):
     try:
         await bot.send_message(LOGGER_GROUP_ID, message, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Failed to send log to channel: {e}")
+    except:
+        pass
 
 async def update_chat_data(chat_id: int, chat_title: str = ""):
     try:
         await chats_col.update_one(
             {"chat_id": chat_id},
-            {
-                "$set": {
-                    "chat_title": chat_title,
-                    "last_seen": time.time(),
-                    "is_group": chat_id < 0
-                }
-            },
+            {"$set": {"chat_title": chat_title, "last_seen": time.time(), "is_group": chat_id < 0}},
             upsert=True
         )
-    except PyMongoError as e:
-        logger.error(f"Failed to update chat data: {e}")
+    except:
+        pass
 
 async def update_user_data(user_id: int, username: str = "", first_name: str = ""):
     try:
         await users_col.update_one(
             {"user_id": user_id},
-            {
-                "$set": {
-                    "username": username,
-                    "first_name": first_name,
-                    "last_seen": time.time()
-                }
-            },
+            {"$set": {"username": username, "first_name": first_name, "last_seen": time.time()}},
             upsert=True
         )
-    except PyMongoError as e:
-        logger.error(f"Failed to update user data: {e}")
+    except:
+        pass
 
 async def is_user_gbanned(user_id: int) -> bool:
     try:
         doc = await gban_col.find_one({"user_id": user_id, "banned": True})
         return doc is not None
-    except PyMongoError as e:
-        logger.error(f"Database error checking gban: {e}")
+    except:
         return False
 
-async def gban_user(user_id: int, reason: str = "No reason provided", banned_by: int = 0):
+async def gban_user(user_id: int, reason: str = "No reason", banned_by: int = 0):
     try:
         user_info = await users_col.find_one({"user_id": user_id})
         username = user_info.get("username", "") if user_info else ""
@@ -333,31 +326,21 @@ async def gban_user(user_id: int, reason: str = "No reason provided", banned_by:
         
         await gban_col.update_one(
             {"user_id": user_id},
-            {
-                "$set": {
-                    "username": username,
-                    "first_name": first_name,
-                    "reason": reason,
-                    "banned_by": banned_by,
-                    "banned_at": time.time(),
-                    "banned": True
-                }
-            },
+            {"$set": {"username": username, "first_name": first_name, "reason": reason, 
+                     "banned_by": banned_by, "banned_at": time.time(), "banned": True}},
             upsert=True
         )
         
         banned_count = 0
         async for chat in chats_col.find({"is_group": True}):
             try:
-                chat_id = chat["chat_id"]
-                await bot.ban_chat_member(chat_id, user_id)
+                await bot.ban_chat_member(chat["chat_id"], user_id)
                 banned_count += 1
-            except Exception as e:
-                logger.error(f"Failed to ban from chat {chat_id}: {e}")
+            except:
+                pass
         
         return banned_count
-    except PyMongoError as e:
-        logger.error(f"Failed to gban user: {e}")
+    except:
         return 0
 
 async def ungban_user(user_id: int) -> bool:
@@ -367,108 +350,44 @@ async def ungban_user(user_id: int) -> bool:
             {"$set": {"banned": False}}
         )
         return result.modified_count > 0
-    except PyMongoError as e:
-        logger.error(f"Failed to ungban user: {e}")
+    except:
         return False
 
 async def get_bot_stats() -> Dict[str, Any]:
     try:
-        total_chats = await chats_col.count_documents({})
-        total_groups = await chats_col.count_documents({"is_group": True})
-        total_users = await users_col.count_documents({})
-        total_gbanned = await gban_col.count_documents({"banned": True})
-        total_warns = await warns_col.count_documents({})
-        total_logs = await log_col.count_documents({})
-        
         return {
-            "total_chats": total_chats,
-            "total_groups": total_groups,
-            "total_users": total_users,
-            "total_gbanned": total_gbanned,
-            "total_warns": total_warns,
-            "total_logs": total_logs
+            "total_chats": await chats_col.count_documents({}),
+            "total_groups": await chats_col.count_documents({"is_group": True}),
+            "total_users": await users_col.count_documents({}),
+            "total_gbanned": await gban_col.count_documents({"banned": True}),
+            "total_warns": await warns_col.count_documents({}),
+            "total_logs": await log_col.count_documents({})
         }
-    except PyMongoError as e:
-        logger.error(f"Failed to get stats: {e}")
+    except:
         return {}
 
-async def broadcast_message(message: types.Message, forward: bool = False) -> Dict[str, int]:
-    stats = {"success": 0, "failed": 0, "pinned": 0}
-    
-    async for chat in chats_col.find({}):
-        try:
-            chat_id = chat["chat_id"]
-            
-            if forward and message.forward_from_chat:
-                sent_msg = await bot.forward_message(
-                    chat_id=chat_id,
-                    from_chat_id=message.chat.id,
-                    message_id=message.message_id
-                )
-            else:
-                if message.text:
-                    sent_msg = await bot.send_message(chat_id, message.text)
-                elif message.caption:
-                    if message.photo:
-                        sent_msg = await bot.send_photo(
-                            chat_id, 
-                            message.photo[-1].file_id, 
-                            caption=message.caption
-                        )
-                    elif message.video:
-                        sent_msg = await bot.send_video(
-                            chat_id, 
-                            message.video.file_id, 
-                            caption=message.caption
-                        )
-                    elif message.document:
-                        sent_msg = await bot.send_document(
-                            chat_id, 
-                            message.document.file_id, 
-                            caption=message.caption
-                        )
-                    else:
-                        sent_msg = await bot.copy_message(chat_id, message.chat.id, message.message_id)
-                else:
-                    sent_msg = await bot.copy_message(chat_id, message.chat.id, message.message_id)
-            
-            stats["success"] += 1
-            
-            if chat_id < 0:
-                try:
-                    await bot.pin_chat_message(chat_id, sent_msg.message_id)
-                    stats["pinned"] += 1
-                except Exception:
-                    pass
-                    
-        except Exception as e:
-            stats["failed"] += 1
-            logger.error(f"Broadcast failed for chat {chat_id}: {e}")
-    
-    return stats
-
 async def handle_detect_and_action(message: types.Message, file_path: str, media_type: str = "media"):
-    """Analyze media and take action if NSFW - WITH PROPER DELETE"""
+    """Analyze media and delete if NSFW"""
     user_id = message.from_user.id if message.from_user else None
     chat_id = message.chat.id
     
     if not file_path:
-        logger.error("File path is None, skipping analysis")
         return
     
-    logger.info(f"Starting analysis for message ID: {message.message_id} in chat {chat_id}")
+    logger.info(f"Starting analysis: msg_id={message.message_id}, user_id={user_id}")
     
+    # Check gbanned
     if user_id and await is_user_gbanned(user_id):
         try:
             await message.delete()
-            logger.info(f"Deleted message from gbanned user {user_id}")
-        except Exception as e:
-            logger.error(f"Failed to delete message from gbanned user: {e}")
+        except:
+            pass
         return
     
+    # Skip admins/whitelisted
     if user_id:
         if await is_user_admin(chat_id, user_id) or await is_user_whitelisted(chat_id, user_id):
-            logger.info(f"Skipping check for admin/whitelisted user {user_id}")
+            logger.info(f"Skipping admin/whitelisted: {user_id}")
             return
 
     is_nsfw = False
@@ -479,14 +398,12 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
         file_lower = file_path.lower()
         
         if file_lower.endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v", ".3gp")):
-            logger.info(f"Processing video ({media_type}): {file_path}")
             with tempfile.TemporaryDirectory() as tmpdir:
                 frames = await extract_frames(file_path, tmpdir, fps=VIDEO_FPS, max_frames=MAX_VIDEO_FRAMES)
                 if frames:
                     is_nsfw, reason = await analyze_images(frames)
                     
         elif file_lower.endswith(".webp"):
-            logger.info(f"Processing WEBP ({media_type}): {file_path}")
             jpg_path = convert_webp_to_jpg_pil(file_path)
             if jpg_path != file_path and os.path.exists(jpg_path):
                 temp_files_to_cleanup.append(jpg_path)
@@ -503,18 +420,15 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
                         background.save(jpg_path, "JPEG", quality=95)
                         temp_files_to_cleanup.append(jpg_path)
                         is_nsfw, reason = await analyze_images([jpg_path])
-                except Exception as e:
-                    logger.error(f"WEBP fallback failed: {e}")
+                except:
+                    pass
             
         elif file_lower.endswith((".gif", ".gifv")):
-            logger.info(f"Processing GIF ({media_type}): {file_path}")
             with tempfile.TemporaryDirectory() as tmpdir:
                 cmd = [
                     "ffmpeg", "-hide_banner", "-loglevel", "error",
-                    "-i", file_path,
-                    "-vf", f"fps={VIDEO_FPS}",
-                    "-q:v", "3",
-                    "-frames:v", str(MAX_VIDEO_FRAMES),
+                    "-i", file_path, "-vf", f"fps={VIDEO_FPS}",
+                    "-q:v", "3", "-frames:v", str(MAX_VIDEO_FRAMES),
                     os.path.join(tmpdir, "frame_%03d.jpg")
                 ]
                 try:
@@ -526,48 +440,36 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
                     is_nsfw, reason = await analyze_images([file_path])
                     
         else:
-            logger.info(f"Processing image ({media_type}): {file_path}")
             is_nsfw, reason = await analyze_images([file_path])
 
         if is_nsfw:
-            logger.warning(f"NSFW content detected! Message ID: {message.message_id}, User: {user_id}")
+            logger.warning(f"NSFW DETECTED! msg_id={message.message_id}, user_id={user_id}, score={reason.get('score')}")
             await take_moderation_action(message, reason, user_id, chat_id)
         else:
-            logger.info(f"Content is safe - no action taken")
+            logger.info(f"Content is safe")
             
     except Exception as e:
-        logger.error(f"Error in handle_detect_and_action: {e}")
+        logger.error(f"Error in analysis: {e}")
     finally:
         for temp_file in temp_files_to_cleanup:
             try:
                 if os.path.exists(temp_file):
                     os.unlink(temp_file)
-            except Exception as e:
-                logger.error(f"Cleanup error for {temp_file}: {e}")
+            except:
+                pass
 
 async def take_moderation_action(message: types.Message, reason: dict, user_id: int, chat_id: int):
-    """Take moderation action - DELETE FIRST, THEN WARN"""
+    """Delete NSFW message and warn user"""
     
-    # STEP 1: DELETE MESSAGE (with multiple attempts)
-    delete_success = False
+    # STEP 1: DELETE MESSAGE
     try:
-        logger.info(f"ATTEMPTING DELETE: message_id={message.message_id}, chat_id={chat_id}")
+        logger.info(f"ATTEMPTING DELETE: msg_id={message.message_id}, chat_id={chat_id}")
         await message.delete()
-        delete_success = True
-        logger.info(f"âœ… SUCCESS: Deleted NSFW message {message.message_id}")
-        
-        user_name = message.from_user.full_name if message.from_user else "Unknown"
-        log_msg = f"ðŸš¨ NSFW Deleted\nUser: {user_name} ({user_id})\nChat: {message.chat.title or 'Private'}\nReason: {reason}"
-        await log_to_channel(log_msg)
-        
-    except TelegramAPIError as e:
-        logger.error(f"âŒ FAILED to delete message: {str(e)}")
-        delete_success = False
+        logger.info(f"âœ… SUCCESS: Deleted message {message.message_id}")
+    except Exception as e:
+        logger.error(f"âŒ Delete failed: {e}")
 
-    # STEP 2: WARN USER (even if delete failed)
-    if not delete_success:
-        logger.warning(f"Message delete failed, but continuing with warning...")
-    
+    # STEP 2: WARN USER
     try:
         await warns_col.update_one(
             {"chat_id": chat_id, "user_id": user_id},
@@ -585,7 +487,7 @@ async def take_moderation_action(message: types.Message, reason: dict, user_id: 
         doc = await warns_col.find_one({"chat_id": chat_id, "user_id": user_id})
         current_warns = doc.get("warns", 1) if doc else 1
         
-        logger.info(f"âš ï¸  Warning #{current_warns} given to user {user_id}")
+        logger.info(f"âš ï¸ Warning #{current_warns} given to {user_id}")
         
         await log_col.insert_one({
             "chat_id": chat_id,
@@ -594,35 +496,34 @@ async def take_moderation_action(message: types.Message, reason: dict, user_id: 
             "reason": str(reason),
             "timestamp": time.time(),
             "media_type": message.content_type,
-            "warn_count": current_warns,
-            "deleted": delete_success
+            "warn_count": current_warns
         })
         
         try:
             user_name = message.from_user.full_name if message.from_user else "User"
-            warning_msg = await message.chat.send_message(
-                f"âš ï¸ Warning: {user_name} has been warned ({current_warns}/{WARN_LIMIT}) for posting NSFW content."
+            warning_msg = await bot.send_message(
+                chat_id,
+                f"âš ï¸ Warning: {user_name} warned ({current_warns}/{WARN_LIMIT}) for NSFW!"
             )
-            logger.info(f"Sent warning message: {warning_msg.message_id}")
             
-            await asyncio.sleep(15)
+            await asyncio.sleep(10)
             try:
                 await warning_msg.delete()
             except:
                 pass
-        except TelegramAPIError as e:
-            logger.error(f"Failed to send/delete warning message: {e}")
+        except:
+            pass
 
         if current_warns >= WARN_LIMIT:
-            await mute_user(chat_id, user_id, user_name)
+            await mute_user(chat_id, user_id, message.from_user.full_name if message.from_user else "User")
             
-    except PyMongoError as e:
-        logger.error(f"Database error during moderation: {e}")
+    except Exception as e:
+        logger.error(f"Warning failed: {e}")
 
 async def mute_user(chat_id: int, user_id: int, user_name: str):
-    """Mute user"""
+    """Mute user for MUTE_DURATION"""
     try:
-        logger.info(f"ðŸ”‡ MUTING user {user_id} in chat {chat_id}")
+        logger.info(f"ðŸ”‡ MUTING {user_id} in {chat_id}")
         
         until_date = int(time.time()) + MUTE_DURATION
         
@@ -640,10 +541,10 @@ async def mute_user(chat_id: int, user_id: int, user_name: str):
         
         mute_msg = await bot.send_message(
             chat_id, 
-            f"ðŸ”‡ {user_name} has been muted for {MUTE_DURATION // 60} minutes due to repeated NSFW violations."
+            f"ðŸ”‡ {user_name} muted for {MUTE_DURATION // 60} min (NSFW violations)"
         )
         
-        logger.info(f"âœ… User {user_id} muted successfully")
+        logger.info(f"âœ… User {user_id} muted")
         
         await asyncio.sleep(10)
         try:
@@ -651,92 +552,26 @@ async def mute_user(chat_id: int, user_id: int, user_name: str):
         except:
             pass
         
-    except TelegramAPIError as e:
-        logger.error(f"Failed to mute user {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"Mute failed: {e}")
 
-# ==================== COMMAND HANDLERS ====================
+# ==================== COMMANDS ====================
 
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message):
-    welcome_text = (
-        "ðŸ›¡ï¸ NSFW Content Moderation Bot\n\n"
-        "Features:\n"
-        "âœ… Smart NSFW detection\n"
-        "âœ… Auto-delete NSFW content\n"
-        "âœ… Warning system (3 = mute)\n"
+    await msg.answer(
+        "ðŸ›¡ï¸ NSFW Moderation Bot\n\n"
+        "âœ… Auto-detects & deletes NSFW\n"
+        "âœ… 3 warnings = mute\n"
         "âœ… Global ban system\n\n"
-        "Admin Commands:\n"
-        "/warn_status - Check warnings\n"
-        "/warn_reset - Reset warnings\n"
-        "/whitelist_add - Whitelist user\n\n"
-        "Owner Commands:\n"
-        "/stats - Statistics\n"
-        "/gban - Global ban\n"
-        "/ungban - Remove ban\n"
-        "/gbanlist - Banned users\n"
+        "/warn_status /warn_reset /whitelist_add\n"
+        "/stats /gban /ungban /gbanlist"
     )
-    
-    await msg.answer(welcome_text)
-    logger.info(f"/start command from {msg.from_user.id}")
+    logger.info(f"/start from {msg.from_user.id}")
 
 @dp.message(Command("help"))
 async def help_cmd(msg: types.Message):
     await start_cmd(msg)
-
-@dp.message(Command("broadcast"))
-async def broadcast_cmd(msg: types.Message):
-    if not await is_owner(msg.from_user.id):
-        return
-    
-    if not msg.reply_to_message:
-        await msg.reply("Please reply to a message to broadcast it.")
-        return
-    
-    processing_msg = await msg.reply("Starting broadcast...")
-    
-    try:
-        stats = await broadcast_message(msg.reply_to_message, forward=True)
-        result_text = f"âœ… Broadcast Complete\nSuccess: {stats['success']}\nFailed: {stats['failed']}"
-        await processing_msg.edit_text(result_text)
-    except Exception as e:
-        await processing_msg.edit_text(f"âŒ Failed: {str(e)}")
-
-@dp.message(Command("gban"))
-async def gban_cmd(msg: types.Message):
-    if not await is_owner(msg.from_user.id):
-        return
-    
-    if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("Reply to a user message to gban them.")
-        return
-    
-    target_user = msg.reply_to_message.from_user
-    reason = " ".join(msg.text.split()[1:]) or "No reason"
-    
-    try:
-        banned_count = await gban_user(target_user.id, reason, msg.from_user.id)
-        await msg.reply(f"âœ… {target_user.full_name} globally banned from {banned_count} groups")
-    except Exception as e:
-        await msg.reply(f"âŒ Failed: {str(e)}")
-
-@dp.message(Command("ungban"))
-async def ungban_cmd(msg: types.Message):
-    if not await is_owner(msg.from_user.id):
-        return
-    
-    if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("Reply to a user message to ungban them.")
-        return
-    
-    target_user = msg.reply_to_message.from_user
-    
-    try:
-        if await ungban_user(target_user.id):
-            await msg.reply(f"âœ… {target_user.full_name} unbanned")
-        else:
-            await msg.reply("User was not gbanned")
-    except Exception as e:
-        await msg.reply(f"âŒ Failed: {str(e)}")
 
 @dp.message(Command("stats"))
 async def stats_cmd(msg: types.Message):
@@ -745,84 +580,77 @@ async def stats_cmd(msg: types.Message):
     
     try:
         stats = await get_bot_stats()
-        stats_text = (
-            "ðŸ“Š Bot Statistics\n\n"
-            f"Chats: {stats.get('total_chats', 0)}\n"
-            f"Groups: {stats.get('total_groups', 0)}\n"
-            f"Users: {stats.get('total_users', 0)}\n"
-            f"GBanned: {stats.get('total_gbanned', 0)}\n"
-            f"Warnings: {stats.get('total_warns', 0)}\n"
-            f"Logs: {stats.get('total_logs', 0)}"
-        )
-        await msg.reply(stats_text)
-    except Exception as e:
-        await msg.reply(f"âŒ Failed: {str(e)}")
-
-@dp.message(Command("gbanlist"))
-async def gbanlist_cmd(msg: types.Message):
-    if not await is_owner(msg.from_user.id):
-        return
-    
-    try:
-        gbanned = []
-        async for user in gban_col.find({"banned": True}).limit(50):
-            info = f"â€¢ {user.get('first_name', 'Unknown')} (@{user.get('username', 'N/A')})"
-            gbanned.append(info)
-        
-        text = "ðŸš« GBanned Users:\n\n" + "\n".join(gbanned) if gbanned else "No users gbanned"
+        text = f"ðŸ“Š Stats\nChats: {stats.get('total_chats', 0)}\nGroups: {stats.get('total_groups', 0)}\nUsers: {stats.get('total_users', 0)}\nGbanned: {stats.get('total_gbanned', 0)}"
         await msg.reply(text)
-    except Exception as e:
-        await msg.reply(f"âŒ Failed: {str(e)}")
-
-@dp.message(Command("warn_reset"))
-async def reset_warns_cmd(msg: types.Message):
-    if not await is_user_admin(msg.chat.id, msg.from_user.id):
-        return
-    
-    if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("Reply to a user message to reset warnings.")
-        return
-    
-    target = msg.reply_to_message.from_user
-    try:
-        await warns_col.delete_one({"chat_id": msg.chat.id, "user_id": target.id})
-        await msg.reply(f"âœ… Warnings reset for {target.full_name}")
     except:
-        await msg.reply("âŒ Failed")
+        pass
+
+@dp.message(Command("gban"))
+async def gban_cmd(msg: types.Message):
+    if not await is_owner(msg.from_user.id) or not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return
+    
+    try:
+        target = msg.reply_to_message.from_user
+        await gban_user(target.id, "NSFW ban", msg.from_user.id)
+        await msg.reply(f"âœ… {target.full_name} gbanned")
+    except:
+        pass
+
+@dp.message(Command("ungban"))
+async def ungban_cmd(msg: types.Message):
+    if not await is_owner(msg.from_user.id) or not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return
+    
+    try:
+        target = msg.reply_to_message.from_user
+        if await ungban_user(target.id):
+            await msg.reply(f"âœ… {target.full_name} unbanned")
+        else:
+            await msg.reply("User not gbanned")
+    except:
+        pass
 
 @dp.message(Command("warn_status"))
 async def warn_status_cmd(msg: types.Message):
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("Reply to a user message to check warnings.")
         return
     
-    target = msg.reply_to_message.from_user
     try:
+        target = msg.reply_to_message.from_user
         doc = await warns_col.find_one({"chat_id": msg.chat.id, "user_id": target.id})
         warns = doc.get("warns", 0) if doc else 0
-        await msg.reply(f"âš ï¸ {target.full_name}: {warns}/{WARN_LIMIT} warnings")
+        await msg.reply(f"âš ï¸ {target.full_name}: {warns}/{WARN_LIMIT}")
     except:
-        await msg.reply("âŒ Failed")
+        pass
+
+@dp.message(Command("warn_reset"))
+async def warn_reset_cmd(msg: types.Message):
+    if not await is_user_admin(msg.chat.id, msg.from_user.id) or not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return
+    
+    try:
+        target = msg.reply_to_message.from_user
+        await warns_col.delete_one({"chat_id": msg.chat.id, "user_id": target.id})
+        await msg.reply(f"âœ… Warnings reset for {target.full_name}")
+    except:
+        pass
 
 @dp.message(Command("whitelist_add"))
 async def whitelist_add_cmd(msg: types.Message):
-    if not await is_user_admin(msg.chat.id, msg.from_user.id):
+    if not await is_user_admin(msg.chat.id, msg.from_user.id) or not msg.reply_to_message or not msg.reply_to_message.from_user:
         return
     
-    if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("Reply to a user message to whitelist them.")
-        return
-    
-    target = msg.reply_to_message.from_user
     try:
+        target = msg.reply_to_message.from_user
         await whitelist_col.update_one(
             {"chat_id": msg.chat.id, "user_id": target.id},
             {"$set": {"username": target.username, "full_name": target.full_name}},
             upsert=True
         )
-        await msg.reply(f"âœ… {target.full_name} added to whitelist")
+        await msg.reply(f"âœ… {target.full_name} whitelisted")
     except:
-        await msg.reply("âŒ Failed")
+        pass
 
 # ==================== MEDIA HANDLERS ====================
 
@@ -830,12 +658,10 @@ async def whitelist_add_cmd(msg: types.Message):
 async def handle_photo(msg: types.Message):
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
-    
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     
-    logger.info(f"ðŸ“· Photo from {msg.from_user.id} in {msg.chat.id}")
-    
+    logger.info(f"ðŸ“· Photo from {msg.from_user.id}")
     try:
         async with temporary_download(msg.photo[-1], ".jpg") as file_path:
             if file_path:
@@ -847,17 +673,15 @@ async def handle_photo(msg: types.Message):
 async def handle_sticker(msg: types.Message):
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
-    
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     
-    logger.info(f"ðŸŽ¨ Sticker from {msg.from_user.id} - type: {msg.sticker.type}")
-    
+    logger.info(f"ðŸŽ¨ Sticker - type: {msg.sticker.type}")
     try:
         ext = ".webm" if msg.sticker.is_video else ".webp"
         async with temporary_download(msg.sticker, ext) as file_path:
             if file_path:
-                await handle_detect_and_action(msg, file_path, f"sticker")
+                await handle_detect_and_action(msg, file_path, "sticker")
     except Exception as e:
         logger.error(f"Sticker error: {e}")
 
@@ -865,12 +689,10 @@ async def handle_sticker(msg: types.Message):
 async def handle_video(msg: types.Message):
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
-    
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     
-    logger.info(f"ðŸŽ¬ Video from {msg.from_user.id}")
-    
+    logger.info(f"ðŸŽ¬ Video")
     try:
         async with temporary_download(msg.video, ".mp4") as file_path:
             if file_path:
@@ -882,12 +704,10 @@ async def handle_video(msg: types.Message):
 async def handle_animation(msg: types.Message):
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
-    
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     
-    logger.info(f"ðŸŽžï¸ GIF from {msg.from_user.id}")
-    
+    logger.info(f"ðŸŽžï¸ GIF")
     try:
         async with temporary_download(msg.animation, ".mp4") as file_path:
             if file_path:
@@ -899,7 +719,6 @@ async def handle_animation(msg: types.Message):
 async def handle_document(msg: types.Message):
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
-    
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     
@@ -907,15 +726,14 @@ async def handle_document(msg: types.Message):
     name = msg.document.file_name or ""
     
     if mime.startswith(('image/', 'video/')) or any(name.lower().endswith(x) for x in 
-        ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.mp4', '.mkv', '.webm', '.mov']):
+        ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.mp4', '.mkv', '.webm']):
         
-        logger.info(f"ðŸ“„ Media document: {name}")
-        
+        logger.info(f"ðŸ“„ Document: {name}")
         try:
             ext = '.jpg' if mime.startswith('image/') else '.mp4'
             async with temporary_download(msg.document, ext) as file_path:
                 if file_path:
-                    await handle_detect_and_action(msg, file_path, f"document")
+                    await handle_detect_and_action(msg, file_path, "document")
         except Exception as e:
             logger.error(f"Document error: {e}")
 
@@ -923,12 +741,10 @@ async def handle_document(msg: types.Message):
 async def handle_video_note(msg: types.Message):
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
-    
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     
-    logger.info(f"ðŸŽ¥ Video note from {msg.from_user.id}")
-    
+    logger.info(f"ðŸŽ¥ Video note")
     try:
         async with temporary_download(msg.video_note, ".mp4") as file_path:
             if file_path:
@@ -940,42 +756,38 @@ async def handle_video_note(msg: types.Message):
 async def handle_text(msg: types.Message):
     if msg.chat.type != "private":
         await update_chat_data(msg.chat.id, msg.chat.title)
-    
     if msg.from_user:
         await update_user_data(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
 
-# ==================== DATABASE SETUP ====================
+# ==================== DATABASE ====================
 
 async def setup_database():
     try:
         await warns_col.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
-        await warns_col.create_index([("last_warn", 1)], expireAfterSeconds=30*24*3600)
         await log_col.create_index([("chat_id", 1), ("timestamp", -1)])
         await whitelist_col.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
         await gban_col.create_index([("user_id", 1)], unique=True)
         await chats_col.create_index([("chat_id", 1)], unique=True)
         await users_col.create_index([("user_id", 1)], unique=True)
-        logger.info("âœ… Database indexes created")
-    except PyMongoError as e:
-        logger.error(f"Database error: {e}")
+        logger.info("âœ… Database ready")
+    except:
+        pass
 
 async def on_startup(bot):
     logger.info("ðŸš€ Bot starting...")
     await setup_database()
     await log_to_channel("âœ… NSFW Bot Started!")
-    logger.info("âœ… Bot ready!")
+    logger.info("âœ… Ready!")
 
 async def on_shutdown(bot):
-    logger.info("ðŸ›‘ Bot shutting down...")
+    logger.info("ðŸ›‘ Shutting down...")
     await log_to_channel("â›” NSFW Bot Offline")
     mongo.close()
 
 async def main():
     Path("logs").mkdir(exist_ok=True)
-    
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-    
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
