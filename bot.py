@@ -12,15 +12,16 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from aiogram.utils.exceptions import TelegramAPIError
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.enums import ParseMode
 from nudenet import NudeClassifier
 from PIL import Image
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
 # Configuration
-BOT_TOKEN = "8395371421:AAHeXyUrhwFf-4WdgLe3eU5xCymdCH1snyA"
+BOT_TOKEN = "8498609067:AAFumiioVKuUP-HM9PEC7FveoE9j-2H8rDo"
 OWNER_IDS = [7641743441, 6361404699]
 LOGGER_GROUP_ID = -1002529491709
 MONGODB_URI = "mongodb+srv://deathhide08:UZYSj9T0VuAgIFAB@cluster0.elg19jx.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
@@ -36,7 +37,7 @@ ALLOWED_PRIVATE = False
 
 # Initialize bot and components
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 
 # Setup logging
 logging.basicConfig(
@@ -155,7 +156,7 @@ async def is_user_admin(chat_id: int, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         return member.is_chat_admin()
-    except TelegramAPIError as e:
+    except Exception as e:
         logger.error(f"Failed to check admin status: {e}")
         return False
 
@@ -284,7 +285,7 @@ async def get_bot_stats() -> Dict[str, Any]:
         logger.error(f"Failed to get stats: {e}")
         return {}
 
-async def broadcast_message(message: types.Message, forward: bool = False) -> Dict[str, int]:
+async def broadcast_message(message: Message, forward: bool = False) -> Dict[str, int]:
     """Broadcast message to all chats"""
     stats = {"success": 0, "failed": 0, "pinned": 0}
     
@@ -292,7 +293,7 @@ async def broadcast_message(message: types.Message, forward: bool = False) -> Di
         try:
             chat_id = chat["chat_id"]
             
-            if forward and message.forward_from_chat:
+            if forward:
                 # Forward the message
                 sent_msg = await bot.forward_message(
                     chat_id=chat_id,
@@ -301,31 +302,7 @@ async def broadcast_message(message: types.Message, forward: bool = False) -> Di
                 )
             else:
                 # Copy the message
-                if message.text:
-                    sent_msg = await bot.send_message(chat_id, message.text)
-                elif message.caption:
-                    if message.photo:
-                        sent_msg = await bot.send_photo(
-                            chat_id, 
-                            message.photo[-1].file_id, 
-                            caption=message.caption
-                        )
-                    elif message.video:
-                        sent_msg = await bot.send_video(
-                            chat_id, 
-                            message.video.file_id, 
-                            caption=message.caption
-                        )
-                    elif message.document:
-                        sent_msg = await bot.send_document(
-                            chat_id, 
-                            message.document.file_id, 
-                            caption=message.caption
-                        )
-                    else:
-                        sent_msg = await bot.copy_message(chat_id, message.chat.id, message.message_id)
-                else:
-                    sent_msg = await bot.copy_message(chat_id, message.chat.id, message.message_id)
+                sent_msg = await message.copy_to(chat_id)
             
             stats["success"] += 1
             
@@ -343,7 +320,7 @@ async def broadcast_message(message: types.Message, forward: bool = False) -> Di
     
     return stats
 
-async def handle_detect_and_action(message: types.Message, file_path: str, origin: str = "media"):
+async def handle_detect_and_action(message: Message, file_path: str, origin: str = "media"):
     """Handle NSFW detection and take appropriate action"""
     user_id = message.from_user.id if message.from_user else None
     chat_id = message.chat.id
@@ -399,7 +376,7 @@ async def handle_detect_and_action(message: types.Message, file_path: str, origi
             except Exception as e:
                 logger.error(f"Cleanup error for {temp_file}: {e}")
 
-async def take_moderation_action(message: types.Message, reason: dict, user_id: int, chat_id: int):
+async def take_moderation_action(message: Message, reason: dict, user_id: int, chat_id: int):
     """Take moderation actions for NSFW content"""
     try:
         # Delete the offensive message
@@ -410,7 +387,7 @@ async def take_moderation_action(message: types.Message, reason: dict, user_id: 
         user_name = message.from_user.full_name if message.from_user else "Unknown"
         await log_to_channel(f"🚫 NSFW Detected\nUser: {user_name} ({user_id})\nChat: {message.chat.title}\nReason: {reason}")
         
-    except TelegramAPIError as e:
+    except Exception as e:
         logger.error(f"Failed to delete message: {e}")
 
     # Update warning count
@@ -452,7 +429,7 @@ async def take_moderation_action(message: types.Message, reason: dict, user_id: 
             # Delete warning message after 10 seconds
             await asyncio.sleep(10)
             await warning_msg.delete()
-        except TelegramAPIError:
+        except Exception:
             pass
 
         # Apply mute if over limit
@@ -490,12 +467,12 @@ async def mute_user(chat_id: int, user_id: int, user_name: str):
         await asyncio.sleep(15)
         await mute_msg.delete()
         
-    except TelegramAPIError as e:
+    except Exception as e:
         logger.error(f"Failed to mute user {user_id}: {e}")
 
 # Message handlers
-@dp.message_handler(content_types=types.ContentType.ANY)
-async def all_messages(msg: types.Message):
+@dp.message()
+async def all_messages(msg: Message):
     """Handle all incoming messages"""
     # Update chat and user data
     if msg.chat.type != "private":
@@ -541,8 +518,8 @@ async def all_messages(msg: types.Message):
         logger.error(f"Error processing message {msg.message_id}: {e}")
 
 # Owner Commands
-@dp.message_handler(commands=["broadcast"])
-async def broadcast_cmd(msg: types.Message):
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(msg: Message):
     """Broadcast message to all chats (owner only)"""
     if not await is_owner(msg.from_user.id):
         return
@@ -569,8 +546,8 @@ async def broadcast_cmd(msg: types.Message):
     except Exception as e:
         await processing_msg.edit_text(f"❌ Broadcast failed: {str(e)}")
 
-@dp.message_handler(commands=["gban"])
-async def gban_cmd(msg: types.Message):
+@dp.message(Command("gban"))
+async def gban_cmd(msg: Message):
     """Globally ban a user (owner only)"""
     if not await is_owner(msg.from_user.id):
         return
@@ -599,8 +576,8 @@ async def gban_cmd(msg: types.Message):
     except Exception as e:
         await processing_msg.edit_text(f"❌ GBan failed: {str(e)}")
 
-@dp.message_handler(commands=["ungban"])
-async def ungban_cmd(msg: types.Message):
+@dp.message(Command("ungban"))
+async def ungban_cmd(msg: Message):
     """Remove global ban from user (owner only)"""
     if not await is_owner(msg.from_user.id):
         return
@@ -626,8 +603,8 @@ async def ungban_cmd(msg: types.Message):
     except Exception as e:
         await processing_msg.edit_text(f"❌ Ungban failed: {str(e)}")
 
-@dp.message_handler(commands=["stats"])
-async def stats_cmd(msg: types.Message):
+@dp.message(Command("stats"))
+async def stats_cmd(msg: Message):
     """Show bot statistics (owner only)"""
     if not await is_owner(msg.from_user.id):
         return
@@ -652,8 +629,8 @@ async def stats_cmd(msg: types.Message):
     except Exception as e:
         await processing_msg.edit_text(f"❌ Failed to get stats: {str(e)}")
 
-@dp.message_handler(commands=["gbanlist"])
-async def gbanlist_cmd(msg: types.Message):
+@dp.message(Command("gbanlist"))
+async def gbanlist_cmd(msg: Message):
     """Show gbanned users list (owner only)"""
     if not await is_owner(msg.from_user.id):
         return
@@ -677,8 +654,8 @@ async def gbanlist_cmd(msg: types.Message):
         await msg.reply(f"❌ Failed to get gbanlist: {str(e)}")
 
 # Admin Commands
-@dp.message_handler(commands=["warn_reset"])
-async def reset_warns_cmd(msg: types.Message):
+@dp.message(Command("warn_reset"))
+async def reset_warns_cmd(msg: Message):
     """Reset warnings for a user (admin only)"""
     if not await is_user_admin(msg.chat.id, msg.from_user.id):
         return
@@ -697,8 +674,8 @@ async def reset_warns_cmd(msg: types.Message):
     except PyMongoError as e:
         await msg.reply("❌ Failed to reset warnings.")
 
-@dp.message_handler(commands=["warn_status"])
-async def warn_status_cmd(msg: types.Message):
+@dp.message(Command("warn_status"))
+async def warn_status_cmd(msg: Message):
     """Check warning status for a user"""
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
         await msg.reply("Please reply to a user's message to check their warnings.")
@@ -712,8 +689,8 @@ async def warn_status_cmd(msg: types.Message):
     except PyMongoError as e:
         await msg.reply("❌ Failed to check warning status.")
 
-@dp.message_handler(commands=["whitelist_add"])
-async def whitelist_add_cmd(msg: types.Message):
+@dp.message(Command("whitelist_add"))
+async def whitelist_add_cmd(msg: Message):
     """Add user to whitelist (admin only)"""
     if not await is_user_admin(msg.chat.id, msg.from_user.id):
         return
@@ -750,28 +727,23 @@ async def setup_database():
     except PyMongoError as e:
         logger.error(f"Failed to create database indexes: {e}")
 
-async def on_startup(dp):
-    """Bot startup tasks"""
-    logger.info("Starting moderation bot...")
+async def main():
+    """Main function to start the bot"""
     await setup_database()
     await log_to_channel("🤖 Bot Started Successfully!")
     logger.info("Bot started successfully")
-
-async def on_shutdown(dp):
-    """Bot shutdown tasks"""
-    logger.info("Shutting down moderation bot...")
-    await log_to_channel("🔴 Bot Shutting Down...")
-    await mongo.close()
-    logger.info("Bot shutdown complete")
+    
+    # Start polling
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     # Create necessary directories
     Path("logs").mkdir(exist_ok=True)
     
     # Start the bot
-    executor.start_polling(
-        dp, 
-        skip_updates=True,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown
-    )
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
