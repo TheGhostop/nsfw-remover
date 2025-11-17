@@ -1,5 +1,8 @@
 aiogram==3.3.0
 motor==3.3.2
 pymongo==4.6.2
-nudenet==2.0.7
 Pillow==10.1.0
+opencv-python==4.8.1.78
+numpy==1.24.3
+aiohttp==3.9.1
+requests==2.31.0
