@@ -26,15 +26,15 @@ MONGODB_URI = "mongodb+srv://deathhide08:UZYSj9T0VuAgIFAB@cluster0.elg19jx.mongo
 DATABASE_NAME = "nsfw_db"
 
 # Bot Settings
-WARN_LIMIT = 5  # 🚨 CHANGED: 3 -> 5
+WARN_LIMIT = 5
 MAX_VIDEO_FRAMES = 6
 VIDEO_FPS = 1
 MUTE_DURATION = 1800
 
-# Thresholds
-NSFW_MIN_SCORE = 4.0
-NSFW_SKIN_THRESHOLD = 0.35
-NSFW_FLESH_THRESHOLD = 0.35
+# Thresholds - INCREASED TO REDUCE FALSE POSITIVES
+NSFW_MIN_SCORE = 6.0  # Increased from 4.0 to 6.0
+NSFW_SKIN_THRESHOLD = 0.45  # Increased from 0.35
+NSFW_FLESH_THRESHOLD = 0.45  # Increased from 0.35
 
 # Image URL for welcome message
 WELCOME_IMAGE_URL = "https://i.ibb.co/KzK6R4zW/IMG-20251117-212221-098.jpg"
@@ -65,84 +65,157 @@ chats_col = db.chats
 users_col = db.users
 
 def detect_nsfw_improved(image_path: str) -> Tuple[bool, Optional[dict]]:
-    """Improved NSFW detection"""
+    """Improved NSFW detection with better false positive prevention"""
     try:
         img = cv2.imread(image_path)
         if img is None:
             logger.warning(f"Could not read image: {image_path}")
             return False, None
 
+        # Get image dimensions
+        height, width = img.shape[:2]
+        total_pixels = height * width
+        
+        # Skip very small images (like stickers)
+        if total_pixels < 10000:  # Very small images are usually safe
+            logger.info(f"Small image detected ({total_pixels} pixels), likely safe")
+            return False, None
+
+        # Enhanced face detection
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        
+        face_area = 0
+        for (x, y, w, h) in faces:
+            face_area += w * h
+        
+        face_ratio = face_area / total_pixels if total_pixels > 0 else 0
+        
+        # If significant face area detected, apply much stricter rules
+        if face_ratio > 0.15:  # If more than 15% of image is faces
+            logger.info(f"Significant face area detected ({face_ratio:.2%}), applying strict rules")
+            NSFW_MIN_SCORE_TEMP = 8.0  # Very high threshold for face images
+        elif face_ratio > 0.05:  # If some faces detected
+            logger.info(f"Face detected ({face_ratio:.2%}), applying lenient rules")
+            NSFW_MIN_SCORE_TEMP = 7.0  # Higher threshold
+        else:
+            NSFW_MIN_SCORE_TEMP = NSFW_MIN_SCORE
+
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-        lower_skin = np.array([0, 15, 60], dtype=np.uint8)
-        upper_skin = np.array([25, 255, 255], dtype=np.uint8)
+        # Skin color detection in HSV
+        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+        upper_skin = np.array([20, 255, 255], dtype=np.uint8)
         mask_skin = cv2.inRange(hsv, lower_skin, upper_skin)
+        
+        # Morphological operations to remove noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_skin = cv2.morphologyEx(mask_skin, cv2.MORPH_OPEN, kernel)
+        mask_skin = cv2.morphologyEx(mask_skin, cv2.MORPH_CLOSE, kernel)
+        
         skin_pixels = cv2.countNonZero(mask_skin)
         skin_percentage = skin_pixels / mask_skin.size
         logger.info(f"Skin pixels: {skin_percentage:.2%}")
 
+        # Flesh tone detection in RGB (more accurate)
         b, g, r = cv2.split(img)
-        flesh_mask = cv2.inRange(r, 95, 220) & \
-                    cv2.inRange(g, 40, 220) & \
-                    cv2.inRange(b, 20, 220)
-        flesh_mask2 = cv2.inRange(r, 95, 220) & \
-                     cv2.inRange(g, 40, 200) & \
-                     cv2.inRange(b, 20, 100)
-        combined_flesh = cv2.bitwise_or(flesh_mask, flesh_mask2)
-        flesh_pixels = cv2.countNonZero(combined_flesh)
-        flesh_percentage = flesh_pixels / combined_flesh.size
+        
+        # More specific flesh tone ranges to avoid false positives
+        flesh_mask = (
+            (r >= 100) & (r <= 200) &
+            (g >= 50) & (g <= 180) &
+            (b >= 30) & (b <= 150) &
+            (r > g) & (g > b)  # Skin typically has R > G > B
+        ).astype(np.uint8) * 255
+        
+        flesh_pixels = cv2.countNonZero(flesh_mask)
+        flesh_percentage = flesh_pixels / flesh_mask.size
         logger.info(f"Flesh tone pixels: {flesh_percentage:.2%}")
 
+        # Edge detection for shape analysis
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 100, 200)
+        edges = cv2.Canny(gray, 50, 150)
         edge_pixels = cv2.countNonZero(edges)
         edge_density = edge_pixels / edges.size
         logger.info(f"Edge density: {edge_density:.2%}")
 
+        # Color analysis
         saturation = hsv[:, :, 1]
-        low_sat_pixels = np.sum(saturation < 100)
-        low_sat_percentage = low_sat_pixels / saturation.size
-        logger.info(f"Low saturation (skin-like): {low_sat_percentage:.2%}")
+        avg_saturation = np.mean(saturation)
+        logger.info(f"Average saturation: {avg_saturation:.1f}")
+
+        # Brightness analysis
+        value_channel = hsv[:, :, 2]
+        avg_brightness = np.mean(value_channel)
+        logger.info(f"Average brightness: {avg_brightness:.1f}")
 
         nsfw_score = 0
         reasons = []
 
-        if skin_percentage >= NSFW_SKIN_THRESHOLD and flesh_percentage >= NSFW_FLESH_THRESHOLD:
-            nsfw_score += 3
+        # STRICTER SCORING SYSTEM TO REDUCE FALSE POSITIVES
+        
+        # Only penalize if both skin AND flesh are high
+        if skin_percentage >= 0.50 and flesh_percentage >= 0.50:
+            nsfw_score += 3.0
             reasons.append(f"High skin ({skin_percentage:.1%}) AND flesh ({flesh_percentage:.1%})")
+        elif skin_percentage >= 0.40 and flesh_percentage >= 0.40:
+            nsfw_score += 2.0
+            reasons.append(f"Moderate skin ({skin_percentage:.1%}) + flesh ({flesh_percentage:.1%})")
 
-        if skin_percentage >= 0.85:
+        # Extreme skin coverage
+        if skin_percentage >= 0.80:
             nsfw_score += 2.5
-            reasons.append(f"Extreme skin tone: {skin_percentage:.1%}")
-        elif skin_percentage >= 0.50 and flesh_percentage >= 0.50:
-            nsfw_score += 2
-            reasons.append(f"High skin ({skin_percentage:.1%}) + flesh ({flesh_percentage:.1%})")
-
-        if skin_percentage >= 0.70:
+            reasons.append(f"Extreme skin: {skin_percentage:.1%}")
+        elif skin_percentage >= 0.65:
             nsfw_score += 1.5
-            reasons.append(f"Very high skin coverage: {skin_percentage:.1%}")
+            reasons.append(f"Very high skin: {skin_percentage:.1%}")
 
-        if flesh_percentage > 0.50:
-            nsfw_score += 1
-            reasons.append(f"Flesh-heavy image: {flesh_percentage:.1%}")
-
-        if skin_percentage > 0.30 and edge_density > 0.15:
+        # Flesh-heavy with moderate skin
+        if flesh_percentage > 0.60 and skin_percentage > 0.30:
             nsfw_score += 1.5
-            reasons.append(f"Skin with defined edges (curves): {edge_density:.1%}")
+            reasons.append(f"Flesh-heavy with skin: {flesh_percentage:.1%}")
 
-        if skin_percentage > 0.40 and low_sat_percentage > 0.6:
+        # Skin with defined edges (potential curves)
+        if skin_percentage > 0.35 and edge_density > 0.20:
             nsfw_score += 1.5
-            reasons.append(f"Skin + low saturation (natural skin): {low_sat_percentage:.1%}")
+            reasons.append(f"Skin with edges: {edge_density:.1%}")
 
-        logger.info(f"NSFW Score: {nsfw_score:.1f}")
+        # Natural skin detection (low saturation + skin)
+        if skin_percentage > 0.40 and avg_saturation < 80:
+            nsfw_score += 1.0
+            reasons.append(f"Natural skin (low sat): {avg_saturation:.1f}")
+
+        # DEDUCTIONS FOR LIKELY SAFE CONTENT
+        
+        # High brightness often indicates safe content
+        if avg_brightness > 180:
+            nsfw_score -= 1.0
+            reasons.append(f"High brightness safe: {avg_brightness:.1f}")
+        
+        # High saturation often indicates cartoons/stickers
+        if avg_saturation > 150:
+            nsfw_score -= 1.5
+            reasons.append(f"High saturation safe: {avg_saturation:.1f}")
+            
+        # Very low skin percentage is safe
+        if skin_percentage < 0.10:
+            nsfw_score -= 2.0
+            reasons.append(f"Low skin safe: {skin_percentage:.1%}")
+
+        # Ensure score doesn't go negative
+        nsfw_score = max(0, nsfw_score)
+
+        logger.info(f"NSFW Score: {nsfw_score:.1f} (Threshold: {NSFW_MIN_SCORE_TEMP})")
         logger.info(f"Reasons: {reasons}")
 
-        if nsfw_score >= NSFW_MIN_SCORE:
+        if nsfw_score >= NSFW_MIN_SCORE_TEMP:
             return True, {
                 "method": "improved_detection",
                 "score": nsfw_score,
                 "skin_percentage": skin_percentage,
                 "flesh_percentage": flesh_percentage,
+                "edge_density": edge_density,
                 "reasons": reasons
             }
 
@@ -206,8 +279,6 @@ async def extract_frames(video_path: str, out_dir: str, fps: int = 1, max_frames
     except:
         return []
 
-
-
 async def analyze_image(image_path: str) -> Tuple[bool, Optional[dict]]:
     """Analyze single image"""
     if not image_path or not os.path.exists(image_path):
@@ -216,8 +287,6 @@ async def analyze_image(image_path: str) -> Tuple[bool, Optional[dict]]:
         return detect_nsfw_improved(image_path)
     except:
         return False, None
-
-
 
 async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
     """Analyze multiple images"""
@@ -239,8 +308,6 @@ async def analyze_images(paths: List[str]) -> Tuple[bool, Optional[dict]]:
         return False, None
     except:
         return False, None
-
-
 
 async def is_user_whitelisted(chat_id: int, user_id: int) -> bool:
     try:
@@ -435,7 +502,6 @@ async def handle_detect_and_action(message: types.Message, file_path: str, media
             except:
                 pass
 
-
 async def take_moderation_action(message: types.Message, reason: dict, user_id: int, chat_id: int):
     """Delete NSFW message and warn user"""
     # STEP 1: DELETE MESSAGE
@@ -477,9 +543,22 @@ async def take_moderation_action(message: types.Message, reason: dict, user_id: 
 
         try:
             user_name = message.from_user.full_name if message.from_user else "User"
+            # Create warning message with control buttons
+            control_buttons = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="➖ Remove Warn", callback_data=f"remove_warn_{user_id}_{chat_id}"),
+                    InlineKeyboardButton(text="➕ Add Warn", callback_data=f"add_warn_{user_id}_{chat_id}")
+                ],
+                [
+                    InlineKeyboardButton(text="🔊 Unmute User", callback_data=f"unmute_{user_id}_{chat_id}")
+                ]
+            ])
+            
             warning_msg = await bot.send_message(
                 chat_id,
-                f"⚠️ Warning: {user_name} warned ({current_warns}/{WARN_LIMIT}) for NSFW!"
+                f"<b><i>⚠️ Warning:</i></b> <b><i>{user_name}</i></b> <b><i>warned ({current_warns}/{WARN_LIMIT}) for NSFW!</i></b>",
+                reply_markup=control_buttons,
+                parse_mode="HTML"
             )
             await asyncio.sleep(10)
             try:
@@ -496,7 +575,7 @@ async def take_moderation_action(message: types.Message, reason: dict, user_id: 
         logger.error(f"⚠️ Warning failed: {e}")
 
 async def mute_user(chat_id: int, user_id: int, user_name: str):
-    """Mute user with unmute button"""
+    """Mute user with control buttons"""
     try:
         logger.info(f"🔇 MUTING {user_id} in {chat_id}")
         until_date = int(time.time()) + MUTE_DURATION
@@ -513,17 +592,24 @@ async def mute_user(chat_id: int, user_id: int, user_name: str):
             until_date=until_date
         )
 
-        # Create inline button for unmute
-        unmute_button = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔊 Unmute User", callback_data=f"unmute_{user_id}_{chat_id}")]
+        # Create control buttons for mute message
+        control_buttons = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➖ Remove Warn", callback_data=f"remove_warn_{user_id}_{chat_id}"),
+                InlineKeyboardButton(text="➕ Add Warn", callback_data=f"add_warn_{user_id}_{chat_id}")
+            ],
+            [
+                InlineKeyboardButton(text="🔊 Unmute User", callback_data=f"unmute_{user_id}_{chat_id}")
+            ]
         ])
 
         mute_msg = await bot.send_message(
             chat_id,
-            f"🔇 {user_name} muted for {MUTE_DURATION // 60} min (NSFW violations)\n\n⏰ Will auto-unmute after timeout.",
-            reply_markup=unmute_button
+            f"<b><i>🔇 {user_name} muted for {MUTE_DURATION // 60} min (NSFW violations)</i></b>\n\n<b><i>⏰ Will auto-unmute after timeout.</i></b>",
+            reply_markup=control_buttons,
+            parse_mode="HTML"
         )
-        logger.info(f"✅ User {user_id} muted with unmute button")
+        logger.info(f"✅ User {user_id} muted with control buttons")
 
     except Exception as e:
         logger.error(f"🔇 Mute failed: {e}")
@@ -532,7 +618,7 @@ async def mute_user(chat_id: int, user_id: int, user_name: str):
 
 @dp.callback_query(lambda query: query.data.startswith("unmute_"))
 async def unmute_callback(query: types.CallbackQuery):
-    """Handle unmute button"""
+    """Handle unmute button - also resets warnings"""
     try:
         data_parts = query.data.split("_")
         user_id = int(data_parts[1])
@@ -555,17 +641,127 @@ async def unmute_callback(query: types.CallbackQuery):
             )
         )
 
-        await query.answer("✅ User unmuted!", show_alert=False)
+        # Reset warnings when unmuted
+        await warns_col.delete_one({"chat_id": chat_id, "user_id": user_id})
+
+        await query.answer("✅ User unmuted and warnings reset!", show_alert=False)
 
         # Edit message
         user = await bot.get_chat_member(chat_id, user_id)
         await query.message.edit_text(
-            f"✅ {user.user.full_name} unmuted by {query.from_user.full_name}"
+            f"<b><i>✅ {user.user.full_name} unmuted by {query.from_user.full_name}</i></b>\n<b><i>⚠️ Warnings have been reset.</i></b>",
+            parse_mode="HTML"
         )
-        logger.info(f"🔊 User {user_id} unmuted by {query.from_user.id}")
+        logger.info(f"🔊 User {user_id} unmuted and warnings reset by {query.from_user.id}")
 
     except Exception as e:
         logger.error(f"Unmute error: {e}")
+        await query.answer(f"❌ Error: {str(e)}", show_alert=True)
+
+@dp.callback_query(lambda query: query.data.startswith("remove_warn_"))
+async def remove_warn_callback(query: types.CallbackQuery):
+    """Handle remove warning button"""
+    try:
+        data_parts = query.data.split("_")
+        user_id = int(data_parts[2])
+        chat_id = int(data_parts[3])
+
+        # Check if callback user is admin
+        if not await is_user_admin(chat_id, query.from_user.id):
+            await query.answer("❌ Only admins can remove warnings!", show_alert=True)
+            return
+
+        # Get current warnings
+        doc = await warns_col.find_one({"chat_id": chat_id, "user_id": user_id})
+        current_warns = doc.get("warns", 0) if doc else 0
+
+        if current_warns > 0:
+            new_warns = max(0, current_warns - 1)
+            if new_warns == 0:
+                await warns_col.delete_one({"chat_id": chat_id, "user_id": user_id})
+            else:
+                await warns_col.update_one(
+                    {"chat_id": chat_id, "user_id": user_id},
+                    {"$set": {"warns": new_warns}}
+                )
+
+            user = await bot.get_chat_member(chat_id, user_id)
+            await query.answer(f"✅ Warning removed! Current: {new_warns}/{WARN_LIMIT}", show_alert=False)
+            
+            # Update message with new warn count
+            control_buttons = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="➖ Remove Warn", callback_data=f"remove_warn_{user_id}_{chat_id}"),
+                    InlineKeyboardButton(text="➕ Add Warn", callback_data=f"add_warn_{user_id}_{chat_id}")
+                ],
+                [
+                    InlineKeyboardButton(text="🔊 Unmute User", callback_data=f"unmute_{user_id}_{chat_id}")
+                ]
+            ])
+            
+            await query.message.edit_text(
+                f"<b><i>⚠️ {user.user.full_name}: {new_warns}/{WARN_LIMIT} warnings</i></b>",
+                reply_markup=control_buttons,
+                parse_mode="HTML"
+            )
+        else:
+            await query.answer("❌ No warnings to remove!", show_alert=True)
+
+    except Exception as e:
+        logger.error(f"Remove warn error: {e}")
+        await query.answer(f"❌ Error: {str(e)}", show_alert=True)
+
+@dp.callback_query(lambda query: query.data.startswith("add_warn_"))
+async def add_warn_callback(query: types.CallbackQuery):
+    """Handle add warning button"""
+    try:
+        data_parts = query.data.split("_")
+        user_id = int(data_parts[2])
+        chat_id = int(data_parts[3])
+
+        # Check if callback user is admin
+        if not await is_user_admin(chat_id, query.from_user.id):
+            await query.answer("❌ Only admins can add warnings!", show_alert=True)
+            return
+
+        # Get current warnings
+        doc = await warns_col.find_one({"chat_id": chat_id, "user_id": user_id})
+        current_warns = doc.get("warns", 0) if doc else 0
+
+        new_warns = current_warns + 1
+        
+        await warns_col.update_one(
+            {"chat_id": chat_id, "user_id": user_id},
+            {"$set": {"warns": new_warns}},
+            upsert=True
+        )
+
+        user = await bot.get_chat_member(chat_id, user_id)
+        await query.answer(f"✅ Warning added! Current: {new_warns}/{WARN_LIMIT}", show_alert=False)
+
+        # Check if should mute
+        if new_warns >= WARN_LIMIT:
+            await mute_user(chat_id, user_id, user.user.full_name)
+
+        # Update message with new warn count
+        control_buttons = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➖ Remove Warn", callback_data=f"remove_warn_{user_id}_{chat_id}"),
+                InlineKeyboardButton(text="➕ Add Warn", callback_data=f"add_warn_{user_id}_{chat_id}")
+            ],
+            [
+                InlineKeyboardButton(text="🔊 Unmute User", callback_data=f"unmute_{user_id}_{chat_id}")
+            ]
+        ])
+        
+        await query.message.edit_text(
+            f"<b><i>⚠️ {user.user.full_name}: {new_warns}/{WARN_LIMIT} warnings</i></b>",
+            reply_markup=control_buttons,
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        logger.error(f"Add warn error: {e}")
         await query.answer(f"❌ Error: {str(e)}", show_alert=True)
 
 # ==================== COMMANDS ====================
@@ -583,26 +779,26 @@ async def start_cmd(msg: types.Message):
         await bot.send_photo(
             msg.chat.id,
             photo=WELCOME_IMAGE_URL,
-            caption="🛡️ **NSFW Content Moderation Bot**\n\n"
-                   "✅ Auto-detects & deletes NSFW\n"
-                   "✅ Smart warning system (5 = mute)\n"
-                   "✅ Global ban system\n"
-                   "✅ Admin controls\n\n"
-                   "🚀 Click below to add me to your group!",
-            parse_mode="Markdown",
+            caption="<b><i>🛡️ NSFW Content Moderation Bot</i></b>\n\n"
+                   "<b><i>✅ Auto-detects & deletes NSFW</i></b>\n"
+                   "<b><i>✅ Smart warning system (5 = mute)</i></b>\n"
+                   "<b><i>✅ Global ban system</i></b>\n"
+                   "<b><i>✅ Admin controls</i></b>\n\n"
+                   "<b><i>🚀 Click below to add me to your group!</i></b>",
+            parse_mode="HTML",
             reply_markup=add_button
         )
     except Exception as e:
         logger.error(f"Photo send failed: {e}")
         # Fallback to text
         await msg.answer(
-            "🛡️ **NSFW Content Moderation Bot**\n\n"
-            "✅ Auto-detects & deletes NSFW\n"
-            "✅ Smart warning system (5 = mute)\n"
-            "✅ Global ban system\n"
-            "✅ Admin controls\n\n"
-            "🚀 Click below to add me to your group!",
-            parse_mode="Markdown",
+            "<b><i>🛡️ NSFW Content Moderation Bot</i></b>\n\n"
+            "<b><i>✅ Auto-detects & deletes NSFW</i></b>\n"
+            "<b><i>✅ Smart warning system (5 = mute)</i></b>\n"
+            "<b><i>✅ Global ban system</i></b>\n"
+            "<b><i>✅ Admin controls</i></b>\n\n"
+            "<b><i>🚀 Click below to add me to your group!</i></b>",
+            parse_mode="HTML",
             reply_markup=add_button
         )
 
@@ -611,38 +807,38 @@ async def start_cmd(msg: types.Message):
 @dp.message(Command("help"))
 async def help_cmd(msg: types.Message):
     await msg.answer(
-        "📋 **Available Commands:**\n\n"
-        "/start - Show welcome message\n"
-        "/stats - Bot statistics (owner)\n"
-        "/warn_status - Check warnings\n"
-        "/warn_reset - Reset warnings (admin)\n"
-        "/whitelist_add - Whitelist user (admin)\n"
-        "/gban - Global ban (owner)\n"
-        "/ungban - Remove ban (owner)\n\n"
-        "🛡️ Protect your group now!",
-        parse_mode="Markdown"
+        "<b><i>📋 Available Commands:</i></b>\n\n"
+        "<b><i>/start - Show welcome message</i></b>\n"
+        "<b><i>/stats - Bot statistics (owner)</i></b>\n"
+        "<b><i>/warn_status - Check warnings</i></b>\n"
+        "<b><i>/warn_reset - Reset warnings (admin)</i></b>\n"
+        "<b><i>/whitelist_add - Whitelist user (admin)</i></b>\n"
+        "<b><i>/gban - Global ban (owner)</i></b>\n"
+        "<b><i>/ungban - Remove ban (owner)</i></b>\n\n"
+        "<b><i>🛡️ Protect your group now!</i></b>",
+        parse_mode="HTML"
     )
 
 @dp.message(Command("stats"))
 async def stats_cmd(msg: types.Message):
     if not await is_owner(msg.from_user.id):
-        await msg.reply("❌ Owner only!")
+        await msg.reply("<b><i>❌ Owner only!</i></b>", parse_mode="HTML")
         return
 
     try:
         stats = await get_bot_stats()
         text = (
-            "📊 **Bot Statistics**\n\n"
-            f"💬 Total Chats: {stats.get('total_chats', 0)}\n"
-            f"👥 Groups: {stats.get('total_groups', 0)}\n"
-            f"👤 Users: {stats.get('total_users', 0)}\n"
-            f"🚫 GBanned: {stats.get('total_gbanned', 0)}\n"
-            f"⚠️ Total Warns: {stats.get('total_warns', 0)}\n"
-            f"📝 Total Logs: {stats.get('total_logs', 0)}"
+            "<b><i>📊 Bot Statistics</i></b>\n\n"
+            f"<b><i>💬 Total Chats: {stats.get('total_chats', 0)}</i></b>\n"
+            f"<b><i>👥 Groups: {stats.get('total_groups', 0)}</i></b>\n"
+            f"<b><i>👤 Users: {stats.get('total_users', 0)}</i></b>\n"
+            f"<b><i>🚫 GBanned: {stats.get('total_gbanned', 0)}</i></b>\n"
+            f"<b><i>⚠️ Total Warns: {stats.get('total_warns', 0)}</i></b>\n"
+            f"<b><i>📝 Total Logs: {stats.get('total_logs', 0)}</i></b>"
         )
-        await msg.reply(text, parse_mode="Markdown")
+        await msg.reply(text, parse_mode="HTML")
     except:
-        await msg.reply("❌ Error fetching stats")
+        await msg.reply("<b><i>❌ Error fetching stats</i></b>", parse_mode="HTML")
 
 @dp.message(Command("gban"))
 async def gban_cmd(msg: types.Message):
@@ -650,15 +846,15 @@ async def gban_cmd(msg: types.Message):
         return
 
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("❌ Reply to a user message to gban them")
+        await msg.reply("<b><i>❌ Reply to a user message to gban them</i></b>", parse_mode="HTML")
         return
 
     try:
         target = msg.reply_to_message.from_user
         await gban_user(target.id, "NSFW ban", msg.from_user.id)
-        await msg.reply(f"✅ {target.full_name} globally banned")
+        await msg.reply(f"<b><i>✅ {target.full_name} globally banned</i></b>", parse_mode="HTML")
     except:
-        await msg.reply("❌ Error")
+        await msg.reply("<b><i>❌ Error</i></b>", parse_mode="HTML")
 
 @dp.message(Command("ungban"))
 async def ungban_cmd(msg: types.Message):
@@ -666,57 +862,57 @@ async def ungban_cmd(msg: types.Message):
         return
 
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("❌ Reply to a user message")
+        await msg.reply("<b><i>❌ Reply to a user message</i></b>", parse_mode="HTML")
         return
 
     try:
         target = msg.reply_to_message.from_user
         if await ungban_user(target.id):
-            await msg.reply(f"✅ {target.full_name} unbanned")
+            await msg.reply(f"<b><i>✅ {target.full_name} unbanned</i></b>", parse_mode="HTML")
         else:
-            await msg.reply("❌ User not gbanned")
+            await msg.reply("<b><i>❌ User not gbanned</i></b>", parse_mode="HTML")
     except:
-        await msg.reply("❌ Error")
+        await msg.reply("<b><i>❌ Error</i></b>", parse_mode="HTML")
 
 @dp.message(Command("warn_status"))
 async def warn_status_cmd(msg: types.Message):
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("❌ Reply to a user")
+        await msg.reply("<b><i>❌ Reply to a user</i></b>", parse_mode="HTML")
         return
 
     try:
         target = msg.reply_to_message.from_user
         doc = await warns_col.find_one({"chat_id": msg.chat.id, "user_id": target.id})
         warns = doc.get("warns", 0) if doc else 0
-        await msg.reply(f"⚠️ {target.full_name}: {warns}/{WARN_LIMIT} warnings")
+        await msg.reply(f"<b><i>⚠️ {target.full_name}: {warns}/{WARN_LIMIT} warnings</i></b>", parse_mode="HTML")
     except:
         pass
 
 @dp.message(Command("warn_reset"))
 async def warn_reset_cmd(msg: types.Message):
     if not await is_user_admin(msg.chat.id, msg.from_user.id):
-        await msg.reply("❌ Admin only!")
+        await msg.reply("<b><i>❌ Admin only!</i></b>", parse_mode="HTML")
         return
 
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("❌ Reply to a user")
+        await msg.reply("<b><i>❌ Reply to a user</i></b>", parse_mode="HTML")
         return
 
     try:
         target = msg.reply_to_message.from_user
         await warns_col.delete_one({"chat_id": msg.chat.id, "user_id": target.id})
-        await msg.reply(f"✅ Warnings reset for {target.full_name}")
+        await msg.reply(f"<b><i>✅ Warnings reset for {target.full_name}</i></b>", parse_mode="HTML")
     except:
         pass
 
 @dp.message(Command("whitelist_add"))
 async def whitelist_add_cmd(msg: types.Message):
     if not await is_user_admin(msg.chat.id, msg.from_user.id):
-        await msg.reply("❌ Admin only!")
+        await msg.reply("<b><i>❌ Admin only!</i></b>", parse_mode="HTML")
         return
 
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply("❌ Reply to a user")
+        await msg.reply("<b><i>❌ Reply to a user</i></b>", parse_mode="HTML")
         return
 
     try:
@@ -726,7 +922,7 @@ async def whitelist_add_cmd(msg: types.Message):
             {"$set": {"username": target.username, "full_name": target.full_name}},
             upsert=True
         )
-        await msg.reply(f"✅ {target.full_name} whitelisted")
+        await msg.reply(f"<b><i>✅ {target.full_name} whitelisted</i></b>", parse_mode="HTML")
     except:
         pass
 
